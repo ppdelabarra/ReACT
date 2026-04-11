@@ -36,11 +36,12 @@ jobs:
 
       - name: Install libraries
         run: |
+          arduino-cli lib update-index
+          arduino-cli lib install "Adafruit BusIO"
+          arduino-cli lib install "Adafruit ADS1X15"
           arduino-cli lib install "WiFiManager"
           arduino-cli lib install "PubSubClient"
           arduino-cli lib install "ArduinoJson"
-          arduino-cli lib install "Adafruit ADS1X15"
-          arduino-cli lib install "Adafruit BusIO"
 
       - name: Debug file structure (temporary)
         run: |
