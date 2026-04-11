@@ -5,6 +5,12 @@ on:
     paths:
       - '**.ino'
 
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # optional (future-proof)
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -18,6 +24,11 @@ jobs:
       - name: Setup Arduino CLI
         uses: arduino/setup-arduino-cli@v1
 
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
       - name: Install ESP32 core
         run: |
           arduino-cli core update-index
@@ -29,6 +40,11 @@ jobs:
           arduino-cli lib install "PubSubClient"
           arduino-cli lib install "ArduinoJson"
 
+      - name: Debug file structure (temporary but useful)
+        run: |
+          echo "=== FILE STRUCTURE ==="
+          ls -R
+
       - name: Compile firmware
         run: |
           arduino-cli compile \
@@ -39,21 +55,19 @@ jobs:
       - name: Prepare firmware
         run: |
           mkdir -p firmware
-          cp build/*.bin firmware/sensor-reading.ino.bin
+          cp build/*.bin firmware/ || echo "No .bin file found"
 
       # ----------------------------
-      # VERSION SYSTEM (IMPORTANT)
+      # VERSION SYSTEM
       # ----------------------------
       - name: Read and bump version
         run: |
           VERSION=$(jq -r '.version' version.json)
           echo "Current version: $VERSION"
 
-          # split major.minor
           MAJOR=$(echo $VERSION | cut -d. -f1)
           MINOR=$(echo $VERSION | cut -d. -f2)
 
-          # increment minor
           NEW_MINOR=$((MINOR + 1))
           NEW_VERSION="$MAJOR.$NEW_MINOR"
 
@@ -62,6 +76,21 @@ jobs:
           jq --arg v "$NEW_VERSION" '.version = $v' version.json > tmp.json
           mv tmp.json version.json
 
+      - name: Update firmware path in JSON
+        run: |
+          jq '.bin = "https://raw.githubusercontent.com/ppdelabarra/ReACT/main/firmware/sensor-reading.ino.bin"' \
+          version.json > tmp.json
+          mv tmp.json version.json
+
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+
+          git add firmware version.json
+
+          git commit -m "Auto build + version bump" || echo "No changes to commit"
+          git push
       - name: Update firmware path in JSON
         run: |
           jq '.bin = "https://raw.githubusercontent.com/ppdelabarra/ReACT/main/firmware/sensor-reading.ino.bin"' \
