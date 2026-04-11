@@ -21,14 +21,20 @@ jobs:
           arduino-cli core update-index
           arduino-cli core install esp32:esp32
 
+      - name: Install required libraries
+        run: |
+          arduino-cli lib install "WiFiManager"
+          arduino-cli lib install "PubSubClient"
+          arduino-cli lib install "ArduinoJson"
+
       - name: Compile firmware
         run: |
-          arduino-cli compile src \
+          arduino-cli compile \
           --fqbn esp32:esp32:esp32 \
           --output-dir build \
           .
 
-      - name: Upload firmware to repo
+      - name: Prepare firmware
         run: |
           mkdir -p firmware
           cp build/*.bin firmware/sensor-reading.ino.bin
@@ -38,5 +44,5 @@ jobs:
           git config user.name "github-actions"
           git config user.email "actions@github.com"
           git add firmware/sensor-reading.ino.bin
-          git commit -m "Auto-build firmware"
+          git commit -m "Auto build firmware"
           git push
