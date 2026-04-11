@@ -23,7 +23,7 @@ jobs:
 
       - name: Compile firmware
         run: |
-          arduino-cli compile \
+          arduino-cli compile src \
           --fqbn esp32:esp32:esp32 \
           --output-dir build \
           .
