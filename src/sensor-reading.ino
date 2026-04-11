@@ -3,194 +3,252 @@
 #include <PubSubClient.h>
 #include <WiFiManager.h>
 #include <ArduinoOTA.h>
-#include <HTTPUpdate.h>
 #include <HTTPClient.h>
+#include <HTTPUpdate.h>
 #include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
 
-// -------- VERSION CONTROL --------
+// ===================== OTA VERSION =====================
 const char* currentVersion = "0.0";
 const char* version_url = "https://raw.githubusercontent.com/ppdelabarra/ReACT/main/version.json";
 
-// -------- MQTT --------
+// ===================== CALIBRATION =====================
+const char* calibration_url =
+"https://raw.githubusercontent.com/ppdelabarra/ReACT/main/config/calibration.json";
+
+// ===================== MQTT =====================
 const char* mqtt_server = "7e43d9945d5748a782e8a2c3257f6743.s1.eu.hivemq.cloud";
-const int   mqtt_port   = 8883;
-const char* mqtt_user   = "ReACT";
-const char* mqtt_pass   = "ThermalComfort2026";
+const int mqtt_port = 8883;
+const char* mqtt_user = "ReACT";
+const char* mqtt_pass = "ThermalComfort2026";
 
 const char* topic_wind = "sensor/wind_speed";
 
-// -------- SENSOR --------
-const int OutPin = 36;
-const float ZERO_VOLTS = 1.075;
-const float V_REF = 3.34;
-const float ADC_RES = 4096.0;
+// ===================== ADS1115 =====================
+Adafruit_ADS1115 ads;
 
-// -------- CLIENTS --------
+const float ADS_VREF = 4.096;
+const float ADS_COUNTS = 32767.0;
+
+// ===================== MQTT CLIENT =====================
 WiFiClientSecure espClient;
 PubSubClient client(espClient);
 
-// -------- OTA UPDATE FUNCTION --------
+// ===================== DEVICE ID =====================
+String deviceId;
+
+// ===================== CALIBRATION STRUCT =====================
+struct Calibration {
+  float zeroVolts;
+  float scale;
+  float exponent;
+};
+
+Calibration calib;
+
+// ===================== OTA UPDATE =====================
 void updateFirmware(String url) {
-    Serial.println("Starting OTA update...");
-    Serial.println(url);
+  Serial.println("OTA update starting...");
+  WiFiClientSecure updateClient;
+  updateClient.setInsecure();
 
-    WiFiClientSecure client;
-    client.setInsecure();
+  t_httpUpdate_return ret = httpUpdate.update(updateClient, url);
 
-    t_httpUpdate_return ret = httpUpdate.update(client, url);
-
-    switch (ret) {
-        case HTTP_UPDATE_FAILED:
-            Serial.printf("Update failed (%d): %s\n",
-                httpUpdate.getLastError(),
-                httpUpdate.getLastErrorString().c_str());
-            break;
-
-        case HTTP_UPDATE_NO_UPDATES:
-            Serial.println("No updates available.");
-            break;
-
-        case HTTP_UPDATE_OK:
-            Serial.println("Update successful. Rebooting...");
-            break;
-    }
+  if (ret == HTTP_UPDATE_OK) {
+    Serial.println("Update OK → rebooting");
+  } else if (ret == HTTP_UPDATE_NO_UPDATES) {
+    Serial.println("No update");
+  } else {
+    Serial.printf("Update failed: %d\n", httpUpdate.getLastError());
+  }
 }
 
-// -------- VERSION CHECK --------
+// ===================== VERSION CHECK =====================
 void checkForUpdate() {
-    Serial.println("Checking for updates...");
 
-    HTTPClient http;
-    http.begin(version_url);
+  WiFiClientSecure https;
+  https.setInsecure();
 
-    int httpCode = http.GET();
+  HTTPClient http;
+  http.begin(https, version_url);
 
-    if (httpCode == 200) {
-        String payload = http.getString();
+  int code = http.GET();
 
-        StaticJsonDocument<512> doc;
-        DeserializationError error = deserializeJson(doc, payload);
+  if (code == 200) {
 
-        if (!error) {
-            String latestVersion = doc["version"];
-            String binUrl = doc["bin"];
+    String payload = http.getString();
 
-            Serial.print("Current version: ");
-            Serial.println(currentVersion);
+    StaticJsonDocument<512> doc;
+    deserializeJson(doc, payload);
 
-            Serial.print("Latest version: ");
-            Serial.println(latestVersion);
+    String latest = doc["version"];
+    String bin = doc["bin"];
 
-            if (latestVersion != currentVersion) {
-                Serial.println("New version found! Updating...");
-
-                client.disconnect();
-                delay(1000);
-
-                updateFirmware(binUrl);
-            } else {
-                Serial.println("Already up to date.");
-            }
-        } else {
-            Serial.println("JSON parsing failed");
-        }
+    if (latest != currentVersion) {
+      Serial.println("New firmware found");
+      client.disconnect();
+      delay(1000);
+      updateFirmware(bin);
     } else {
-        Serial.print("HTTP error: ");
-        Serial.println(httpCode);
+      Serial.println("Firmware up to date");
     }
+  }
 
-    http.end();
+  http.end();
 }
 
-// -------- MQTT RECONNECT --------
-void reconnect() {
-    while (!client.connected()) {
-        Serial.print("Connecting to MQTT...");
+// ===================== LOAD CALIBRATION =====================
+void loadCalibration() {
 
-        String clientId = "WindSensor-" + WiFi.macAddress();
+  WiFiClientSecure clientSecure;
+  clientSecure.setInsecure();
 
-        if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
-            Serial.println("Connected!");
-        } else {
-            Serial.print("Failed, rc=");
-            Serial.print(client.state());
-            Serial.println(" retrying...");
-            delay(5000);
-        }
+  HTTPClient http;
+  http.begin(clientSecure, calibration_url);
+
+  int code = http.GET();
+
+  if (code == 200) {
+
+    String payload = http.getString();
+
+    StaticJsonDocument<2048> doc;
+    deserializeJson(doc, payload);
+
+    JsonObject devices = doc["devices"];
+    JsonObject dev = devices[deviceId];
+
+    if (!dev.isNull()) {
+
+      calib.zeroVolts = dev["zeroVolts"];
+      calib.scale = dev["scale"];
+      calib.exponent = dev["exponent"];
+
+      Serial.println("Calibration loaded ✔");
+
+    } else {
+
+      Serial.println("No calibration found → using defaults");
+
+      calib.zeroVolts = 1.075;
+      calib.scale = 0.230;
+      calib.exponent = 2.7265;
     }
+  }
+
+  http.end();
 }
 
-// -------- SETUP --------
+// ===================== MQTT RECONNECT =====================
+void reconnectMQTT() {
+
+  while (!client.connected()) {
+
+    String clientId = "WindSensor-" + deviceId;
+
+    Serial.println("Connecting MQTT...");
+
+    if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
+      Serial.println("MQTT connected");
+    } else {
+      Serial.printf("MQTT failed rc=%d\n", client.state());
+      delay(3000);
+    }
+  }
+}
+
+// ===================== WIND SENSOR =====================
+float readWindMS() {
+
+  int16_t raw = ads.readADC_SingleEnded(0);
+
+  float volts = raw * (ADS_VREF / ADS_COUNTS);
+
+  if (volts <= calib.zeroVolts) return 0.0;
+
+  float windMPH = pow(
+    ((volts - calib.zeroVolts) / calib.scale),
+    calib.exponent
+  );
+
+  return windMPH * 0.44704;
+}
+
+// ===================== SETUP =====================
 void setup() {
-    Serial.begin(115200);
 
-    WiFi.mode(WIFI_STA);
-    delay(500);
+  Serial.begin(115200);
 
-    // WiFi Manager
-    WiFiManager wm;
-    if (!wm.autoConnect("ESP32_Wind_Setup")) {
-        Serial.println("WiFi failed. Restarting...");
-        ESP.restart();
-    }
+  WiFi.mode(WIFI_STA);
 
-    Serial.println("WiFi Connected!");
-    Serial.print("IP: ");
-    Serial.println(WiFi.localIP());
+  WiFiManager wm;
+  if (!wm.autoConnect("ESP32_Wind_Setup")) {
+    ESP.restart();
+  }
 
-    Serial.print("MAC: ");
-    Serial.println(WiFi.macAddress());
+  Serial.println("WiFi connected");
 
-    // MQTT
-    espClient.setInsecure();
-    client.setServer(mqtt_server, mqtt_port);
+  deviceId = WiFi.macAddress();
+  Serial.println("Device ID: " + deviceId);
 
-    // OTA (local network)
-    ArduinoOTA.setHostname("ESP32-Wind-Sensor");
-    ArduinoOTA.begin();
+  // MQTT secure (dev mode insecure TLS)
+  espClient.setInsecure();
+  client.setServer(mqtt_server, mqtt_port);
 
-    Serial.println("System Ready.");
+  // OTA
+  ArduinoOTA.setHostname("ESP32-Wind-Sensor");
+  ArduinoOTA.begin();
 
-    // Initial update check
-    checkForUpdate();
+  // ADS1115 init
+  Wire.begin();
+  if (!ads.begin()) {
+    Serial.println("ADS1115 not found!");
+    while (1);
+  }
+
+  ads.setGain(GAIN_ONE);
+
+  // Load calibration from GitHub
+  loadCalibration();
+
+  // Check firmware
+  checkForUpdate();
+
+  Serial.println("System ready");
 }
 
-// -------- LOOP --------
+// ===================== LOOP =====================
 void loop() {
-    ArduinoOTA.handle();
 
-    if (!client.connected()) {
-        reconnect();
-    }
-    client.loop();
+  ArduinoOTA.handle();
 
-    // -------- PERIODIC VERSION CHECK --------
-    static unsigned long lastCheck = 0;
-    if (millis() - lastCheck > 60000) { // every 60 seconds
-        lastCheck = millis();
-        checkForUpdate();
-    }
+  if (!client.connected()) {
+    reconnectMQTT();
+  }
 
-    // -------- SENSOR --------
-    static unsigned long lastSensorRead = 0;
+  client.loop();
 
-    if (millis() - lastSensorRead > 2000) {
-        lastSensorRead = millis();
+  static unsigned long lastSensor = 0;
+  static unsigned long lastUpdate = 0;
 
-        float windVolts = (float)analogRead(OutPin) * (V_REF / ADC_RES);
-        float windMS = 0.0;
+  // ===== SENSOR =====
+  if (millis() - lastSensor > 2000) {
+    lastSensor = millis();
 
-        if (windVolts > ZERO_VOLTS) {
-            float windMPH = pow(((windVolts - ZERO_VOLTS) / 0.2300), 2.7265);
-            windMS = windMPH * 0.44704;
-        }
+    float windMS = readWindMS();
 
-        char msg[10];
-        dtostrf(windMS, 4, 2, msg);
-        client.publish(topic_wind, msg);
+    char msg[16];
+    dtostrf(windMS, 5, 2, msg);
 
-        Serial.print("Wind Speed: ");
-        Serial.print(windMS);
-        Serial.println(" m/s");
-    }
+    client.publish(topic_wind, msg);
+
+    Serial.printf("Wind: %.2f m/s\n", windMS);
+  }
+
+  // ===== OTA CHECK (60s) =====
+  if (millis() - lastUpdate > 60000) {
+    lastUpdate = millis();
+    checkForUpdate();
+  }
 }
