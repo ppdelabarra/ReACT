@@ -10,7 +10,7 @@
 #include <Adafruit_ADS1X15.h>
 
 // ===================== OTA VERSION =====================
-const char* currentVersion = "0.1";
+const char* currentVersion = "0.0";
 const char* version_url = "https://raw.githubusercontent.com/ppdelabarra/ReACT/main/version.json";
 
 // ===================== CALIBRATION =====================
