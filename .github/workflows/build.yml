@@ -34,7 +34,7 @@ jobs:
           arduino-cli compile \
           --fqbn esp32:esp32:esp32 \
           --output-dir build \
-          src/sensor-reading.ino
+          src/sensor-reading/sensor-reading.ino
 
       - name: Prepare firmware
         run: |
