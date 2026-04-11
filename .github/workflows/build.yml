@@ -40,7 +40,7 @@ jobs:
           arduino-cli lib install "PubSubClient"
           arduino-cli lib install "ArduinoJson"
 
-      - name: Debug file structure (temporary but useful)
+      - name: Debug file structure (temporary)
         run: |
           echo "=== FILE STRUCTURE ==="
           ls -R
@@ -88,21 +88,5 @@ jobs:
           git config user.email "actions@github.com"
 
           git add firmware version.json
-
           git commit -m "Auto build + version bump" || echo "No changes to commit"
-          git push
-      - name: Update firmware path in JSON
-        run: |
-          jq '.bin = "https://raw.githubusercontent.com/ppdelabarra/ReACT/main/firmware/sensor-reading.ino.bin"' \
-          version.json > tmp.json
-          mv tmp.json version.json
-
-      - name: Commit changes
-        run: |
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
-
-          git add firmware/sensor-reading.ino.bin version.json
-
-          git commit -m "Auto build + version bump"
           git push
