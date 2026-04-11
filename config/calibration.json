@@ -1,0 +1,9 @@
+{
+  "devices": {
+    "f4:2d:c9:70:b9:88": {
+      "zeroVolts": 1.075,
+      "scale": 0.228,
+      "exponent": 2.73
+    }
+  }
+}
