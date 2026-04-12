@@ -4,12 +4,18 @@
 #include <WiFiManager.h>
 #include <ArduinoOTA.h>
 #include <HTTPClient.h>
+#include <HTTPUpdate.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
-#include <math.h>
+#include <Adafruit_ADS1X15.h>
 
-// ===================== CONFIG =====================
-#define SIMULATION_MODE true
+// ===================== OTA VERSION =====================
+const char* currentVersion = "0.0";
+const char* version_url = "https://raw.githubusercontent.com/ppdelabarra/ReACT/main/version.json";
+
+// ===================== CALIBRATION =====================
+const char* calibration_url =
+"https://raw.githubusercontent.com/ppdelabarra/ReACT/main/config/calibration.json";
 
 // ===================== MQTT =====================
 const char* mqtt_server = "7e43d9945d5748a782e8a2c3257f6743.s1.eu.hivemq.cloud";
@@ -17,88 +23,157 @@ const int mqtt_port = 8883;
 const char* mqtt_user = "ReACT";
 const char* mqtt_pass = "ThermalComfort2026";
 
-// Topics
-const char* topic_wind  = "sensor/wind_speed";
-const char* topic_noise = "sensor/noise_db";
-const char* topic_co2   = "sensor/co2";
-const char* topic_temp  = "sensor/air_temperature";
-const char* topic_hum   = "sensor/humidity";
-const char* topic_globe = "sensor/globe_temperature";
-const char* topic_lux   = "sensor/illuminance";
+const char* topic_wind = "sensor/wind_speed";
 
-// ===================== GLOBALS =====================
+// ===================== ADS1115 =====================
+Adafruit_ADS1115 ads;
+
+const float ADS_VREF = 4.096;
+const float ADS_COUNTS = 32767.0;
+
+// ===================== MQTT CLIENT =====================
 WiFiClientSecure espClient;
 PubSubClient client(espClient);
 
+// ===================== DEVICE ID =====================
 String deviceId;
-float t = 0;
 
-// ===================== MQTT =====================
+// ===================== CALIBRATION STRUCT =====================
+struct Calibration {
+  float zeroVolts;
+  float scale;
+  float exponent;
+};
+
+Calibration calib;
+
+// ===================== OTA UPDATE =====================
+void updateFirmware(String url) {
+  Serial.println("OTA update starting...");
+  WiFiClientSecure updateClient;
+  updateClient.setInsecure();
+
+  t_httpUpdate_return ret = httpUpdate.update(updateClient, url);
+
+  if (ret == HTTP_UPDATE_OK) {
+    Serial.println("Update OK → rebooting");
+  } else if (ret == HTTP_UPDATE_NO_UPDATES) {
+    Serial.println("No update");
+  } else {
+    Serial.printf("Update failed: %d\n", httpUpdate.getLastError());
+  }
+}
+
+// ===================== VERSION CHECK =====================
+void checkForUpdate() {
+
+  WiFiClientSecure https;
+  https.setInsecure();
+
+  HTTPClient http;
+  http.begin(https, version_url);
+
+  int code = http.GET();
+
+  if (code == 200) {
+
+    String payload = http.getString();
+
+    StaticJsonDocument<512> doc;
+    deserializeJson(doc, payload);
+
+    String latest = doc["version"];
+    String bin = doc["bin"];
+
+    if (latest != currentVersion) {
+      Serial.println("New firmware found");
+      client.disconnect();
+      delay(1000);
+      updateFirmware(bin);
+    } else {
+      Serial.println("Firmware up to date");
+    }
+  }
+
+  http.end();
+}
+
+// ===================== LOAD CALIBRATION =====================
+void loadCalibration() {
+
+  WiFiClientSecure clientSecure;
+  clientSecure.setInsecure();
+
+  HTTPClient http;
+  http.begin(clientSecure, calibration_url);
+
+  int code = http.GET();
+
+  if (code == 200) {
+
+    String payload = http.getString();
+
+    StaticJsonDocument<2048> doc;
+    deserializeJson(doc, payload);
+
+    JsonObject devices = doc["devices"];
+    JsonObject dev = devices[deviceId];
+
+    if (!dev.isNull()) {
+
+      calib.zeroVolts = dev["zeroVolts"];
+      calib.scale = dev["scale"];
+      calib.exponent = dev["exponent"];
+
+      Serial.println("Calibration loaded ✔");
+
+    } else {
+
+      Serial.println("No calibration found → using defaults");
+
+      calib.zeroVolts = 1.075;
+      calib.scale = 0.230;
+      calib.exponent = 2.7265;
+    }
+  }
+
+  http.end();
+}
+
+// ===================== MQTT RECONNECT =====================
 void reconnectMQTT() {
+
   while (!client.connected()) {
-    String clientId = "Station-" + deviceId;
+
+    String clientId = "WindSensor-" + deviceId;
 
     Serial.println("Connecting MQTT...");
 
     if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
       Serial.println("MQTT connected");
     } else {
-      Serial.printf("Failed rc=%d\n", client.state());
+      Serial.printf("MQTT failed rc=%d\n", client.state());
       delay(3000);
     }
   }
 }
 
-// ===================== MOCK SENSORS =====================
-#if SIMULATION_MODE
+// ===================== WIND SENSOR =====================
+float readWindMS() {
 
-float mockWind() {
-  t += 0.1f;
-  float wind = 2.0f + 1.5f * sin(t) + random(-20, 20) / 100.0f;
-  return fmaxf(0.0f, wind);
+  int16_t raw = ads.readADC_SingleEnded(0);
+
+  float volts = raw * (ADS_VREF / ADS_COUNTS);
+
+  if (volts <= calib.zeroVolts) return 0.0;
+
+  float windMPH = pow(
+    ((volts - calib.zeroVolts) / calib.scale),
+    calib.exponent
+  );
+
+  return windMPH * 0.44704;
 }
-
-float mockNoise() {
-  float base = 45.0f + 10.0f * sin(t * 2.0f);
-  float noise = base + random(-30, 30) / 10.0f;
-  return noise;
-}
-
-float mockCO2() {
-  return 400.0f + 200.0f * fabs(sin(t / 3.0f)) + random(-20, 20);
-}
-
-float mockTemp() {
-  return 20.0f + 5.0f * sin(t / 5.0f);
-}
-
-float mockHumidity() {
-  return 50.0f + 20.0f * sin(t / 6.0f);
-}
-
-float mockGlobeTemp(float airTemp) {
-  return airTemp + 2.0f + 2.0f * sin(t / 4.0f);
-}
-
-float mockLux() {
-  float dayCycle = fmaxf(0.0f, sin(t / 10.0f));
-  return dayCycle * 800.0f + random(-20, 20);
-}
-
-#endif
-
-// ===================== REAL SENSOR STUBS =====================
-#if !SIMULATION_MODE
-
-float readWind() { return 0; }
-float readNoise() { return 0; }
-float readCO2() { return 0; }
-float readTemp() { return 0; }
-float readHumidity() { return 0; }
-float readGlobeTemp() { return 0; }
-float readLux() { return 0; }
-
-#endif
 
 // ===================== SETUP =====================
 void setup() {
@@ -106,9 +181,9 @@ void setup() {
   Serial.begin(115200);
 
   WiFi.mode(WIFI_STA);
-  WiFiManager wm;
 
-  if (!wm.autoConnect("ESP32_TEST_SETUP")) {
+  WiFiManager wm;
+  if (!wm.autoConnect("ESP32_Wind_Setup")) {
     ESP.restart();
   }
 
@@ -117,17 +192,28 @@ void setup() {
   deviceId = WiFi.macAddress();
   Serial.println("Device ID: " + deviceId);
 
+  // MQTT secure (dev mode insecure TLS)
   espClient.setInsecure();
   client.setServer(mqtt_server, mqtt_port);
 
-  ArduinoOTA.setHostname("ESP32-Test-Station");
+  // OTA
+  ArduinoOTA.setHostname("ESP32-Wind-Sensor");
   ArduinoOTA.begin();
 
-#if SIMULATION_MODE
-  Serial.println("Running in SIMULATION MODE");
-#else
-  Serial.println("Running with REAL SENSORS");
-#endif
+  // ADS1115 init
+  Wire.begin();
+  if (!ads.begin()) {
+    Serial.println("ADS1115 not found!");
+    while (1);
+  }
+
+  ads.setGain(GAIN_ONE);
+
+  // Load calibration from GitHub
+  loadCalibration();
+
+  // Check firmware
+  checkForUpdate();
 
   Serial.println("System ready");
 }
@@ -143,67 +229,26 @@ void loop() {
 
   client.loop();
 
-  static unsigned long lastSend = 0;
+  static unsigned long lastSensor = 0;
+  static unsigned long lastUpdate = 0;
 
-  if (millis() - lastSend > 2000) {
-    lastSend = millis();
+  // ===== SENSOR =====
+  if (millis() - lastSensor > 2000) {
+    lastSensor = millis();
 
-    float wind, noise, co2, temp, hum, globe, lux;
+    float windMS = readWindMS();
 
-#if SIMULATION_MODE
-
-    wind  = mockWind();
-    noise = mockNoise();
-    co2   = mockCO2();
-    temp  = mockTemp();
-    hum   = mockHumidity();
-    globe = mockGlobeTemp(temp);
-    lux   = mockLux();
-
-#else
-
-    wind  = readWind();
-    noise = readNoise();
-    co2   = readCO2();
-    temp  = readTemp();
-    hum   = readHumidity();
-    globe = readGlobeTemp();
-    lux   = readLux();
-
-#endif
-
-    // ===== SERIAL OUTPUT =====
-    Serial.println("---- SENSOR DATA ----");
-    Serial.printf("Wind: %.2f m/s\n", wind);
-    Serial.printf("Noise: %.1f dB\n", noise);
-    Serial.printf("CO2: %.0f ppm\n", co2);
-    Serial.printf("Temp: %.2f C\n", temp);
-    Serial.printf("Humidity: %.1f %%\n", hum);
-    Serial.printf("Globe Temp: %.2f C\n", globe);
-    Serial.printf("Lux: %.0f lx\n", lux);
-
-    // ===== MQTT PUBLISH =====
     char msg[16];
+    dtostrf(windMS, 5, 2, msg);
 
-    dtostrf(wind, 5, 2, msg);
     client.publish(topic_wind, msg);
 
-    dtostrf(noise, 5, 1, msg);
-    client.publish(topic_noise, msg);
+    Serial.printf("Wind: %.2f m/s\n", windMS);
+  }
 
-    dtostrf(co2, 6, 0, msg);
-    client.publish(topic_co2, msg);
-
-    dtostrf(temp, 5, 2, msg);
-    client.publish(topic_temp, msg);
-
-    dtostrf(hum, 5, 1, msg);
-    client.publish(topic_hum, msg);
-
-    dtostrf(globe, 5, 2, msg);
-    client.publish(topic_globe, msg);
-
-    dtostrf(lux, 6, 0, msg);
-    client.publish(topic_lux, msg);
+  // ===== OTA CHECK (60s) =====
+  if (millis() - lastUpdate > 60000) {
+    lastUpdate = millis();
+    checkForUpdate();
   }
 }
