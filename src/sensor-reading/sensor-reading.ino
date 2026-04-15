@@ -6,24 +6,23 @@
 #include <ClosedCube_OPT3001.h>
 #include <math.h>
 
-// Network & OTA Includes
+// Network, OTA & Memory Includes
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <WiFiManager.h>
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
 #include <ArduinoJson.h>
+#include <Preferences.h> // <-- NEW: Allows us to save data permanently
 
 // ================= GITHUB / OTA CONFIG =================
-// IMPORTANT: You MUST change this string every time you compile a new .bin for GitHub!
-const char* currentVersion = "1.0"; 
 const char* version_url = "https://raw.githubusercontent.com/ppdelabarra/ReACT/main/version.json";
 const char* calibration_url = "https://raw.githubusercontent.com/ppdelabarra/ReACT/main/calibration.json";
 
-// RTC Memory survives software reboots. This is our infinite loop safeguard.
-RTC_DATA_ATTR char attempted_version[32] = ""; 
-
+Preferences preferences;
+String currentVersion;
 String deviceId;
+
 unsigned long lastSensorRead = 0;
 unsigned long lastOTAcheck = 0;
 
@@ -32,11 +31,9 @@ unsigned long lastOTAcheck = 0;
 #define SCL_PIN 22
 
 // ================= SENSORS =================
-// OPT3001
 #define OPT3001_ADDRESS 0x45
 ClosedCube_OPT3001 opt3001;
 
-// MAX31865
 #define MAX_CS   5
 #define MAX_MOSI 23
 #define MAX_MISO 19
@@ -45,12 +42,10 @@ ClosedCube_OPT3001 opt3001;
 #define RNOMINAL  100.0
 Adafruit_MAX31865 max31865(MAX_CS, MAX_MOSI, MAX_MISO, MAX_SCK);
 
-// SCD41 & ADS1115
 SCD4x scd41;
 Adafruit_ADS1115 ads;
 
 // ================= CALIBRATION GLOBALS =================
-// Defaults provided to prevent math errors if Wi-Fi/JSON fails
 float wind_zero = 0.0, wind_scale = 1.0, wind_exp = 1.0;
 float noise_ref = 0.01, noise_offset = 60.0;
 
@@ -79,7 +74,7 @@ void fetchCalibration() {
   HTTPClient http;
   
   http.begin(https, calibration_url);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); // Crucial for GitHub
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
   int httpCode = http.GET();
   if (httpCode == 200) {
@@ -111,22 +106,28 @@ void fetchCalibration() {
 }
 
 // ================= OTA FIRMWARE UPDATE =================
-void updateFirmware(String url) {
-  Serial.println("Starting OTA Download...");
+// Notice we now pass the newVersion string into this function
+void updateFirmware(String url, String newVersion) {
+  Serial.println("Starting OTA Download from: " + url);
 
   WiFiClientSecure updateClient;
   updateClient.setInsecure();
   httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
   
-  // Disable automatic reboot so we can print the success message
+  // Disable automatic reboot so we can write to memory first
   httpUpdate.rebootOnUpdate(false);
 
   t_httpUpdate_return ret = httpUpdate.update(updateClient, url);
 
   if (ret == HTTP_UPDATE_OK) {
-    Serial.println("OTA success → rebooting ✅");
+    // --- THIS IS THE MAGIC ---
+    // Update was successful, so we permanently save the new version to memory
+    preferences.putString("fw_version", newVersion);
+    
+    Serial.println("OTA success! Version officially updated to " + newVersion + " ✅");
+    Serial.println("Rebooting in 1 second...");
     delay(1000);
-    ESP.restart(); // Manually restart after logging
+    ESP.restart(); // Now we manually reboot
   } else if (ret == HTTP_UPDATE_NO_UPDATES) {
     Serial.println("No update found.");
   } else {
@@ -150,30 +151,16 @@ void checkForUpdate() {
       String latest = doc["version"];
       String binUrl = doc["bin"];
 
-      Serial.println("Current Version: " + String(currentVersion));
-      Serial.println("Latest Version : " + latest);
+      Serial.println("Device Version: " + currentVersion);
+      Serial.println("GitHub Version: " + latest);
 
-      if (latest != String(currentVersion)) {
-        
-        // --- INFINITE LOOP SAFEGUARD ---
-        if (latest == String(attempted_version)) {
-           Serial.println("⚠️ OTA LOOP PREVENTED: Already installed this .bin but the 'currentVersion' variable inside it didn't change.");
-           Serial.println("⚠️ Please update 'currentVersion' in your code, recompile, and re-upload to GitHub.");
-           return; // Abort the update process
-        }
-
-        Serial.println("New firmware available! Initiating update...");
-        
-        // Save the version we are about to try to RTC memory
-        strncpy(attempted_version, latest.c_str(), sizeof(attempted_version) - 1);
-        
+      // Compare the string saved in memory to the one on GitHub
+      if (latest != currentVersion) {
+        Serial.println("Versions do not match. Initiating update...");
         delay(1000);
-        updateFirmware(binUrl);
+        updateFirmware(binUrl, latest); // Pass the URL and the target version
       } else {
         Serial.println("Firmware is up to date.");
-        
-        // Clear the safeguard memory if we are up to date
-        memset(attempted_version, 0, sizeof(attempted_version));
       }
     }
   } else {
@@ -189,10 +176,16 @@ void setup() {
 
   Serial.println("\n=== SYSTEM BOOT ===");
 
+  // --- Initialize Memory & Load Version ---
+  preferences.begin("react_system", false); // Open memory space named "react_system"
+  // Grab "fw_version". If it doesn't exist yet, default to "0.0"
+  currentVersion = preferences.getString("fw_version", "0.0"); 
+  
+  Serial.println("Running Firmware Version: " + currentVersion);
+
   // --- Wi-Fi Setup ---
   WiFi.mode(WIFI_STA);
   WiFiManager wm;
-  // wm.resetSettings(); // Uncomment to wipe saved Wi-Fi for testing
   Serial.println("Connecting to Wi-Fi...");
   bool connected = wm.autoConnect("ReACT_Station_Setup");
   
