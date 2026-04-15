@@ -2,8 +2,8 @@ name: ESP32 Auto Build + Versioning
 
 on:
   push:
-    paths:
-      - '**.ino'
+    branches:
+      - main
 
 permissions:
   contents: write
