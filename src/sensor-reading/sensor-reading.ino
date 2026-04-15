@@ -15,9 +15,13 @@
 #include <ArduinoJson.h>
 
 // ================= GITHUB / OTA CONFIG =================
-const char* currentVersion = "1.0"; // Update this when pushing new code
+// IMPORTANT: You MUST change this string every time you compile a new .bin for GitHub!
+const char* currentVersion = "1.0"; 
 const char* version_url = "https://raw.githubusercontent.com/ppdelabarra/ReACT/main/version.json";
 const char* calibration_url = "https://raw.githubusercontent.com/ppdelabarra/ReACT/main/calibration.json";
+
+// RTC Memory survives software reboots. This is our infinite loop safeguard.
+RTC_DATA_ATTR char attempted_version[32] = ""; 
 
 String deviceId;
 unsigned long lastSensorRead = 0;
@@ -77,7 +81,8 @@ void fetchCalibration() {
   http.begin(https, calibration_url);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); // Crucial for GitHub
 
-  if (http.GET() == 200) {
+  int httpCode = http.GET();
+  if (httpCode == 200) {
     StaticJsonDocument<4096> doc;
     DeserializationError error = deserializeJson(doc, http.getString());
     
@@ -100,7 +105,7 @@ void fetchCalibration() {
       Serial.println("Failed to parse JSON ❌");
     }
   } else {
-    Serial.println("Failed to download calibration file ❌");
+    Serial.printf("Failed to download calibration file ❌ HTTP Code: %d\n", httpCode);
   }
   http.end();
 }
@@ -112,11 +117,16 @@ void updateFirmware(String url) {
   WiFiClientSecure updateClient;
   updateClient.setInsecure();
   httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
+  
+  // Disable automatic reboot so we can print the success message
+  httpUpdate.rebootOnUpdate(false);
 
   t_httpUpdate_return ret = httpUpdate.update(updateClient, url);
 
   if (ret == HTTP_UPDATE_OK) {
     Serial.println("OTA success → rebooting ✅");
+    delay(1000);
+    ESP.restart(); // Manually restart after logging
   } else if (ret == HTTP_UPDATE_NO_UPDATES) {
     Serial.println("No update found.");
   } else {
@@ -143,12 +153,27 @@ void checkForUpdate() {
       Serial.println("Current Version: " + String(currentVersion));
       Serial.println("Latest Version : " + latest);
 
-      if (latest != currentVersion) {
+      if (latest != String(currentVersion)) {
+        
+        // --- INFINITE LOOP SAFEGUARD ---
+        if (latest == String(attempted_version)) {
+           Serial.println("⚠️ OTA LOOP PREVENTED: Already installed this .bin but the 'currentVersion' variable inside it didn't change.");
+           Serial.println("⚠️ Please update 'currentVersion' in your code, recompile, and re-upload to GitHub.");
+           return; // Abort the update process
+        }
+
         Serial.println("New firmware available! Initiating update...");
+        
+        // Save the version we are about to try to RTC memory
+        strncpy(attempted_version, latest.c_str(), sizeof(attempted_version) - 1);
+        
         delay(1000);
         updateFirmware(binUrl);
       } else {
         Serial.println("Firmware is up to date.");
+        
+        // Clear the safeguard memory if we are up to date
+        memset(attempted_version, 0, sizeof(attempted_version));
       }
     }
   } else {
