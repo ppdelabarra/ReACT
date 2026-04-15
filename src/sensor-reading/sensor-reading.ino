@@ -13,7 +13,8 @@
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
 #include <ArduinoJson.h>
-#include <Preferences.h> // <-- NEW: Allows us to save data permanently
+#include <Preferences.h> 
+#include <PubSubClient.h> // <-- MQTT IS BACK
 
 // ================= GITHUB / OTA CONFIG =================
 const char* version_url = "https://raw.githubusercontent.com/ppdelabarra/ReACT/main/version.json";
@@ -25,6 +26,16 @@ String deviceId;
 
 unsigned long lastSensorRead = 0;
 unsigned long lastOTAcheck = 0;
+
+// ================= MQTT CONFIG =================
+const char* mqtt_server = "7e43d9945d5748a782e8a2c3257f6743.s1.eu.hivemq.cloud";
+const int mqtt_port = 8883;
+const char* mqtt_user = "ReACT";
+const char* mqtt_pass = "ThermalComfort2026";
+
+WiFiClientSecure espClient;
+PubSubClient mqttClient(espClient);
+String topic_base;
 
 // ================= I2C =================
 #define SDA_PIN 21
@@ -65,10 +76,27 @@ void configureOPT3001() {
   }
 }
 
+// ================= MQTT RECONNECT =================
+void reconnectMQTT() {
+  while (!mqttClient.connected()) {
+    Serial.print("Connecting to MQTT...");
+    String clientId = "Station-" + deviceId;
+    
+    if (mqttClient.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
+      Serial.println(" Connected! ✅");
+      mqttClient.publish((topic_base + "status").c_str(), "online", true);
+    } else {
+      Serial.print(" Failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" Trying again in 3 seconds...");
+      delay(3000);
+    }
+  }
+}
+
 // ================= JSON CALIBRATION =================
 void fetchCalibration() {
   Serial.println("Fetching calibration from GitHub...");
-  
   WiFiClientSecure https;
   https.setInsecure();
   HTTPClient http;
@@ -84,14 +112,11 @@ void fetchCalibration() {
     if (!error) {
       if (doc["devices"].containsKey(deviceId)) {
         JsonObject dev = doc["devices"][deviceId];
-
         wind_zero  = dev["wind"]["zeroVolts"] | 0.0;
         wind_scale = dev["wind"]["scale"] | 1.0;
         wind_exp   = dev["wind"]["exponent"] | 1.0;
-
         noise_ref    = dev["noise"]["refVrms"] | 0.01;
         noise_offset = dev["noise"]["dbOffset"] | 60.0;
-
         Serial.println("Calibration loaded successfully ✅");
       } else {
         Serial.println("Device MAC not found in JSON. Using defaults ⚠️");
@@ -106,30 +131,20 @@ void fetchCalibration() {
 }
 
 // ================= OTA FIRMWARE UPDATE =================
-// Notice we now pass the newVersion string into this function
 void updateFirmware(String url, String newVersion) {
   Serial.println("Starting OTA Download from: " + url);
-
   WiFiClientSecure updateClient;
   updateClient.setInsecure();
   httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  
-  // Disable automatic reboot so we can write to memory first
   httpUpdate.rebootOnUpdate(false);
 
   t_httpUpdate_return ret = httpUpdate.update(updateClient, url);
 
   if (ret == HTTP_UPDATE_OK) {
-    // --- THIS IS THE MAGIC ---
-    // Update was successful, so we permanently save the new version to memory
     preferences.putString("fw_version", newVersion);
-    
     Serial.println("OTA success! Version officially updated to " + newVersion + " ✅");
-    Serial.println("Rebooting in 1 second...");
     delay(1000);
-    ESP.restart(); // Now we manually reboot
-  } else if (ret == HTTP_UPDATE_NO_UPDATES) {
-    Serial.println("No update found.");
+    ESP.restart(); 
   } else {
     Serial.printf("OTA failed: %d ❌\n", httpUpdate.getLastError());
   }
@@ -137,7 +152,6 @@ void updateFirmware(String url, String newVersion) {
 
 void checkForUpdate() {
   Serial.println("Checking for firmware updates...");
-  
   WiFiClientSecure https;
   https.setInsecure();
   HTTPClient http;
@@ -154,17 +168,14 @@ void checkForUpdate() {
       Serial.println("Device Version: " + currentVersion);
       Serial.println("GitHub Version: " + latest);
 
-      // Compare the string saved in memory to the one on GitHub
       if (latest != currentVersion) {
         Serial.println("Versions do not match. Initiating update...");
         delay(1000);
-        updateFirmware(binUrl, latest); // Pass the URL and the target version
+        updateFirmware(binUrl, latest);
       } else {
         Serial.println("Firmware is up to date.");
       }
     }
-  } else {
-    Serial.println("Failed to check for updates ❌");
   }
   http.end();
 }
@@ -177,19 +188,15 @@ void setup() {
   Serial.println("\n=== SYSTEM BOOT ===");
 
   // --- Initialize Memory & Load Version ---
-  preferences.begin("react_system", false); // Open memory space named "react_system"
-  // Grab "fw_version". If it doesn't exist yet, default to "0.0"
+  preferences.begin("react_system", false); 
   currentVersion = preferences.getString("fw_version", "0.0"); 
-  
   Serial.println("Running Firmware Version: " + currentVersion);
 
   // --- Wi-Fi Setup ---
   WiFi.mode(WIFI_STA);
   WiFiManager wm;
   Serial.println("Connecting to Wi-Fi...");
-  bool connected = wm.autoConnect("ReACT_Station_Setup");
-  
-  if(connected) {
+  if(wm.autoConnect("ReACT_Station_Setup")) {
     Serial.println("Wi-Fi Connected ✅");
   } else {
     Serial.println("Wi-Fi Connection Failed ❌");
@@ -197,44 +204,45 @@ void setup() {
 
   deviceId = WiFi.macAddress();
   Serial.println("Device MAC ID: " + deviceId);
+  topic_base = "sensor/" + deviceId + "/";
+
+  // --- MQTT Setup ---
+  espClient.setInsecure(); // Required for HiveMQ TLS
+  mqttClient.setServer(mqtt_server, mqtt_port);
 
   // --- Fetch Cloud Configurations ---
   fetchCalibration();
   checkForUpdate();
 
   Serial.println("\n=== SENSOR INITIALIZATION ===");
-
   Wire.begin(SDA_PIN, SCL_PIN);
 
-  // --- SCD41 ---
   if (scd41.begin(Wire)) {
     Serial.println("SCD41 detected ✅");
     scd41.startPeriodicMeasurement();
-  } else {
-    Serial.println("SCD41 NOT detected ❌");
   }
-
-  // --- OPT3001 ---
+  
   opt3001.begin(OPT3001_ADDRESS);
   configureOPT3001();
 
-  // --- ADS1115 ---
   if (ads.begin()) {
     Serial.println("ADS1115 detected ✅");
-    ads.setGain(GAIN_FOUR);  // ±1.024V range
-  } else {
-    Serial.println("ADS1115 NOT detected ❌");
+    ads.setGain(GAIN_FOUR);
   }
 
-  // --- MAX31865 ---
   max31865.begin(MAX31865_4WIRE);
   Serial.println("MAX31865 initialized ✅");
-
   Serial.println("================================\n");
 }
 
 // ================= LOOP =================
 void loop() {
+  // Keep MQTT Alive
+  if (!mqttClient.connected()) {
+    reconnectMQTT();
+  }
+  mqttClient.loop();
+
   unsigned long currentMillis = millis();
 
   // --- Read Sensors Every 5 Seconds ---
@@ -242,27 +250,35 @@ void loop() {
     lastSensorRead = currentMillis;
     
     Serial.println("\n--- SENSOR READINGS ---");
+    char msgBuffer[16]; // Buffer for formatting numbers to strings
 
     // SCD41 (CO2, Temp, Hum)
     if (scd41.getDataReadyStatus() && scd41.readMeasurement()) {
-      Serial.printf("SCD41 -> Temp: %.2f °C | Hum: %.1f %% | CO2: %d ppm\n", 
-                    scd41.getTemperature(), scd41.getHumidity(), scd41.getCO2());
-    } else {
-      Serial.println("SCD41 -> Not ready or failed");
+      float temp = scd41.getTemperature();
+      float hum = scd41.getHumidity();
+      uint16_t co2 = scd41.getCO2();
+      
+      Serial.printf("SCD41 -> Temp: %.2f °C | Hum: %.1f %% | CO2: %d ppm\n", temp, hum, co2);
+      
+      dtostrf(temp, 5, 2, msgBuffer); mqttClient.publish((topic_base + "temp").c_str(), msgBuffer);
+      dtostrf(hum, 5, 1, msgBuffer);  mqttClient.publish((topic_base + "humidity").c_str(), msgBuffer);
+      dtostrf(co2, 6, 0, msgBuffer);  mqttClient.publish((topic_base + "co2").c_str(), msgBuffer);
     }
 
     // OPT3001 (Light)
     OPT3001 result = opt3001.readResult();
     if (result.error == NO_ERROR) {
       Serial.printf("OPT3001 -> Illuminance: %.2f lux\n", result.lux);
+      dtostrf(result.lux, 6, 0, msgBuffer); mqttClient.publish((topic_base + "lux").c_str(), msgBuffer);
     }
 
     // MAX31865 (Globe Temp)
     float globeTemp = max31865.temperature(RNOMINAL, RREF);
     uint8_t fault = max31865.readFault();
     Serial.printf("MAX31865 -> Globe Temp: %.2f °C\n", globeTemp);
-    if (fault) {
-      Serial.printf("MAX31865 -> Fault: 0x%X\n", fault);
+    if (!fault) {
+      dtostrf(globeTemp, 5, 2, msgBuffer); mqttClient.publish((topic_base + "globe").c_str(), msgBuffer);
+    } else {
       max31865.clearFault();
     }
 
@@ -271,11 +287,12 @@ void loop() {
     float voltage0 = adc0 * 0.0000625;
     float windSpeed = 0;
     
-    if (wind_scale != 0.0) { // Protect against divide-by-zero
+    if (wind_scale != 0.0) {
       float x = (voltage0 - wind_zero) / wind_scale;
       windSpeed = (x < 0) ? 0 : pow(x, wind_exp);
     }
     Serial.printf("WIND -> Raw: %.3f V | Speed: %.2f m/s\n", voltage0, windSpeed);
+    dtostrf(windSpeed, 5, 2, msgBuffer); mqttClient.publish((topic_base + "wind").c_str(), msgBuffer);
 
     // Noise Processing (ADC1)
     const int N_SAMPLES = 100;
@@ -302,7 +319,9 @@ void loop() {
     }
     
     Serial.printf("NOISE -> RMS: %.3f mV | SPL: %.1f dB\n", (vrms * 1000.0), noiseDb);
-    Serial.println("------------------------");
+    dtostrf(noiseDb, 5, 1, msgBuffer); mqttClient.publish((topic_base + "noise").c_str(), msgBuffer);
+    
+    Serial.println("--- Data published to MQTT ---");
   }
 
   // --- Check for OTA Every 60 Seconds ---
