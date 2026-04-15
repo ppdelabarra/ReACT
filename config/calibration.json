@@ -1,9 +1,35 @@
 {
   "devices": {
     "f4:2d:c9:70:b9:88": {
-      "zeroVolts": 1.075,
-      "scale": 0.228,
-      "exponent": 2.73
+
+      "wind": {
+        "zeroVolts": 1.075,
+        "scale": 0.228,
+        "exponent": 2.73
+      },
+
+      "noise": {
+        "refVrms": 0.01,
+        "dbOffset": 60.0
+      },
+
+      "light": {
+        "gain": 1.1,
+        "offset": 0.0
+      },
+
+      "globe": {
+        "offset": 0.3
+      },
+
+      "scd41": {
+        "tempOffset": -1.2,
+        "humidityOffset": -3.0
+      },
+
+      "co2": {
+        "forcedCalibration": 400
+      }
     }
   }
 }
