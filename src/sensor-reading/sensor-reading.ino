@@ -1,3 +1,4 @@
+// ================= INCLUDES =================
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <PubSubClient.h>
@@ -7,17 +8,27 @@
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include <math.h>
+#include <Adafruit_ADS1X15.h>
 
-// ===================== CONFIG =====================
-#define SIMULATION_MODE true
+#include "scd41_sensor.h"
+#include "opt3001_sensor.h"
+#include "noise_sensor.h"
+#include "noise_processing.h"
+#include "max31865_sensor.h"
 
-// ===================== MQTT =====================
+// ================= CONFIG =================
+#define SIMULATION_MODE false
+
+const char* calibration_url =
+"https://raw.githubusercontent.com/ppdelabarra/ReACT/main/calibration.json";
+
+// ================= MQTT =================
 const char* mqtt_server = "7e43d9945d5748a782e8a2c3257f6743.s1.eu.hivemq.cloud";
 const int mqtt_port = 8883;
 const char* mqtt_user = "ReACT";
 const char* mqtt_pass = "ThermalComfort2026";
 
-// Topics
+// ================= TOPICS =================
 const char* topic_wind  = "sensor/wind_speed";
 const char* topic_noise = "sensor/noise_db";
 const char* topic_co2   = "sensor/co2";
@@ -26,43 +37,152 @@ const char* topic_hum   = "sensor/humidity";
 const char* topic_globe = "sensor/globe_temperature";
 const char* topic_lux   = "sensor/illuminance";
 
-// ===================== GLOBALS =====================
+// ================= GLOBALS =================
 WiFiClientSecure espClient;
 PubSubClient client(espClient);
 
 String deviceId;
-float t = 0;
 
-// ===================== MQTT =====================
+// ===== Sensors =====
+SCD41Sensor scd;
+OPT3001Sensor light;
+NoiseSensor noise;
+Adafruit_ADS1115 ads;
+
+#define MAX_CS   5
+#define MAX_MOSI 23
+#define MAX_MISO 19
+#define MAX_SCK  18
+MAX31865Sensor globe(MAX_CS, MAX_MOSI, MAX_MISO, MAX_SCK);
+
+float samples[100];
+
+// ===== CALIBRATION VALUES =====
+float wind_zero, wind_scale, wind_exp;
+float noise_ref, noise_offset;
+float lux_gain, lux_offset;
+float globe_offset;
+float scd_temp_offset, scd_hum_offset;
+
+// ================= MQTT =================
 void reconnectMQTT() {
   while (!client.connected()) {
     String clientId = "Station-" + deviceId;
-
-    Serial.println("Connecting MQTT...");
-
-    if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
-      Serial.println("MQTT connected");
-    } else {
-      Serial.printf("Failed rc=%d\n", client.state());
+    if (!client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
       delay(3000);
     }
   }
 }
 
-// ===================== MOCK SENSORS =====================
-#if SIMULATION_MODE
+// ================= FETCH CALIBRATION =================
+void fetchCalibration() {
 
-float mockWind() {
-  t += 0.1f;
-  float wind = 2.0f + 1.5f * sin(t) + random(-20, 20) / 100.0f;
-  return fmaxf(0.0f, wind);
+  HTTPClient http;
+  http.begin(calibration_url);
+
+  if (http.GET() == 200) {
+
+    StaticJsonDocument<4096> doc;
+    deserializeJson(doc, http.getString());
+
+    JsonObject dev = doc["devices"][deviceId];
+
+    wind_zero  = dev["wind"]["zeroVolts"];
+    wind_scale = dev["wind"]["scale"];
+    wind_exp   = dev["wind"]["exponent"];
+
+    noise_ref    = dev["noise"]["refVrms"];
+    noise_offset = dev["noise"]["dbOffset"];
+
+    lux_gain   = dev["light"]["gain"];
+    lux_offset = dev["light"]["offset"];
+
+    globe_offset = dev["globe"]["offset"];
+
+    scd_temp_offset = dev["scd41"]["tempOffset"];
+    scd_hum_offset  = dev["scd41"]["humidityOffset"];
+
+    Serial.println("Calibration loaded");
+  }
+
+  http.end();
 }
 
-float mockNoise() {
-  float base = 45.0f + 10.0f * sin(t * 2.0f);
-  float noise = base + random(-30, 30) / 10.0f;
-  return noise;
+// ================= SENSOR FUNCTIONS =================
+float readWind() {
+  int adc = ads.readADC_SingleEnded(0);
+  float v = adc * 0.0000625;
+  float x = (v - wind_zero) / wind_scale;
+  return (x < 0) ? 0 : pow(x, wind_exp);
 }
+
+float readNoise() {
+  noise.sample(samples, 100);
+  NoiseData nd = processNoise(samples, 100);
+  return 20 * log10((nd.vrms / noise_ref) + 1e-9) + noise_offset;
+}
+
+// ================= SETUP =================
+void setup() {
+
+  Serial.begin(115200);
+
+  WiFi.mode(WIFI_STA);
+  WiFiManager wm;
+  wm.autoConnect("ESP32_SETUP");
+
+  deviceId = WiFi.macAddress();
+
+  espClient.setInsecure();
+  client.setServer(mqtt_server, mqtt_port);
+  ArduinoOTA.begin();
+
+  Wire.begin(21, 22);
+
+  scd.begin(Wire);
+  light.begin();
+  ads.begin();
+  ads.setGain(GAIN_FOUR);
+  globe.begin();
+
+  fetchCalibration();
+}
+
+// ================= LOOP =================
+void loop() {
+
+  ArduinoOTA.handle();
+  if (!client.connected()) reconnectMQTT();
+  client.loop();
+
+  static unsigned long last = 0;
+
+  if (millis() - last > 2000) {
+    last = millis();
+
+    float wind = readWind();
+    float noise = readNoise();
+
+    SCD41Data d;
+    scd.read(d);
+
+    float temp = d.temp + scd_temp_offset;
+    float hum  = d.hum + scd_hum_offset;
+
+    float globeT = globe.readTemperature() + globe_offset;
+    float lux = light.readLux() * lux_gain + lux_offset;
+
+    char msg[16];
+
+    dtostrf(wind,5,2,msg); client.publish(topic_wind,msg);
+    dtostrf(noise,5,1,msg); client.publish(topic_noise,msg);
+    dtostrf(d.co2,6,0,msg); client.publish(topic_co2,msg);
+    dtostrf(temp,5,2,msg); client.publish(topic_temp,msg);
+    dtostrf(hum,5,1,msg); client.publish(topic_hum,msg);
+    dtostrf(globeT,5,2,msg); client.publish(topic_globe,msg);
+    dtostrf(lux,6,0,msg); client.publish(topic_lux,msg);
+  }
+}}
 
 float mockCO2() {
   return 400.0f + 200.0f * fabs(sin(t / 3.0f)) + random(-20, 20);
