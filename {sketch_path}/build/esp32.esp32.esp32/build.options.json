@@ -1,0 +1,10 @@
+{
+  "additionalFiles": "../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..,../..",
+  "builtInToolsFolders": "",
+  "compiler.optimization_flags": "-Os",
+  "customBuildProperties": "build.warn_data_percentage=75",
+  "fqbn": "esp32:esp32:esp32",
+  "hardwareFolders": "/home/runner/.arduino15/packages",
+  "otherLibrariesFolders": "/home/runner/Arduino/libraries",
+  "sketchLocation": "/home/runner/work/ReACT/ReACT/src/sensor-reading"
+}
