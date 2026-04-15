@@ -1,4 +1,4 @@
-name: ESP32 Auto Build + Versioning
+name: ESP32 Auto Build + Versioning #version 0.x
 
 on:
   push:
