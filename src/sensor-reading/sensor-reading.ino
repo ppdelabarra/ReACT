@@ -36,6 +36,7 @@ const char* mqtt_pass = "ThermalComfort2026";
 WiFiClientSecure espClient;
 PubSubClient mqttClient(espClient);
 String topic_base;
+String command_topic;
 
 // ================= I2C =================
 #define SDA_PIN 21
@@ -58,7 +59,9 @@ Adafruit_ADS1115 ads;
 
 // ================= CALIBRATION GLOBALS =================
 float wind_zero = 0.0, wind_scale = 1.0, wind_exp = 1.0;
-float noise_offset = 0.0; // <-- Deleted noise_ref and set default to 0.0
+float noise_offset = 0.0; 
+float scd_temp_offset = 0.0;
+float scd_hum_offset = 0.0;
 
 // ================= OPT3001 CONFIG =================
 void configureOPT3001() {
@@ -76,6 +79,33 @@ void configureOPT3001() {
   }
 }
 
+// ================= MQTT CALLBACK (CO2 CALIBRATION) =================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  String msg;
+  for (int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
+  
+  Serial.println("MQTT Command Received: " + msg);
+
+  // If we receive the exact string "calibrate_co2" on the command topic
+  if (String(topic) == command_topic && msg == "calibrate_co2") {
+    Serial.println("Forcing CO2 Hardware Calibration to 400 ppm...");
+    
+    scd41.stopPeriodicMeasurement();
+    delay(500); // Wait for sensor to stop
+    
+    if (scd41.performForcedRecalibration(400)) {
+      Serial.println("CO2 FRC Successful! ✅");
+    } else {
+      Serial.println("CO2 FRC Failed! ❌");
+    }
+    
+    delay(400);
+    scd41.startPeriodicMeasurement();
+  }
+}
+
 // ================= MQTT RECONNECT =================
 void reconnectMQTT() {
   while (!mqttClient.connected()) {
@@ -84,7 +114,11 @@ void reconnectMQTT() {
     
     if (mqttClient.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
       Serial.println(" Connected! ✅");
+      
+      // Announce we are online and subscribe to the command topic
       mqttClient.publish((topic_base + "status").c_str(), "online", true);
+      mqttClient.subscribe(command_topic.c_str());
+      
     } else {
       Serial.print(" Failed, rc=");
       Serial.print(mqttClient.state());
@@ -113,12 +147,15 @@ void fetchCalibration() {
       if (doc["devices"].containsKey(deviceId)) {
         JsonObject dev = doc["devices"][deviceId];
         
+        // Wind & Noise
         wind_zero  = dev["wind"]["zeroVolts"] | 0.0;
         wind_scale = dev["wind"]["scale"] | 1.0;
         wind_exp   = dev["wind"]["exponent"] | 1.0;
-        
-        // <-- Removed noise_ref JSON pull
         noise_offset = dev["noise"]["dbOffset"] | 0.0; 
+        
+        // SCD41 Software Offsets
+        scd_temp_offset = dev["scd41"]["tempOffset"] | 0.0;
+        scd_hum_offset  = dev["scd41"]["humidityOffset"] | 0.0;
         
         Serial.println("Calibration loaded successfully ✅");
       } else {
@@ -205,13 +242,16 @@ void setup() {
     Serial.println("Wi-Fi Connection Failed ❌");
   }
 
+  // --- Device & Topics ---
   deviceId = WiFi.macAddress();
   Serial.println("Device MAC ID: " + deviceId);
   topic_base = "sensor/" + deviceId + "/";
+  command_topic = topic_base + "command";
 
   // --- MQTT Setup ---
   espClient.setInsecure(); // Required for HiveMQ TLS
   mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setCallback(mqttCallback);
 
   // --- Fetch Cloud Configurations ---
   fetchCalibration();
@@ -257,9 +297,16 @@ void loop() {
 
     // SCD41 (CO2, Temp, Hum)
     if (scd41.getDataReadyStatus() && scd41.readMeasurement()) {
-      float temp = scd41.getTemperature();
-      float hum = scd41.getHumidity();
-      uint16_t co2 = scd41.getCO2();
+      
+      // Apply the JSON Software Offsets here!
+      float temp = scd41.getTemperature() + scd_temp_offset;
+      float hum = scd41.getHumidity() + scd_hum_offset;
+      
+      // Prevent humidity from jumping out of real-world bounds due to offsets
+      if (hum < 0) hum = 0;
+      if (hum > 100) hum = 100;
+      
+      uint16_t co2 = scd41.getCO2(); // CO2 is calibrated via hardware command
       
       Serial.printf("SCD41 -> Temp: %.2f °C | Hum: %.1f %% | CO2: %d ppm\n", temp, hum, co2);
       
@@ -284,51 +331,36 @@ void loop() {
     } else {
       max31865.clearFault();
     }
-
     
     // Wind Processing (ADC0)
     int16_t adc0 = ads.readADC_SingleEnded(0);
-    
-    // Convert to actual voltage 
     float voltage0 = adc0 * 0.000125; 
-
-    // Simulate the 10-bit, 5V Arduino ADC reading the manufacturer's formula expects
     float simulatedArduinoADC = (voltage0 / 5.0) * 1024.0;
-
-    float windSpeedMS = 0.0; // Final speed in meters per second
+    float windSpeedMS = 0.0; 
     
-    if (wind_scale != 0.0) { // Protect against divide-by-zero
+    if (wind_scale != 0.0) { 
       float x = (simulatedArduinoADC - wind_zero) / wind_scale;
-      
-      // Calculate MPH using the manufacturer exponent
       float windMPH = (x < 0) ? 0 : pow(x, wind_exp);
-      
-      // Convert MPH to m/s 
       windSpeedMS = windMPH * 0.44704;
     }
     
     Serial.printf("WIND -> Raw: %.3f V | Sim ADC: %.1f | Speed: %.2f m/s\n", 
                   voltage0, simulatedArduinoADC, windSpeedMS);
-                  
     dtostrf(windSpeedMS, 5, 2, msgBuffer); 
     mqttClient.publish((topic_base + "wind").c_str(), msgBuffer);
 
     
     // Noise Processing (ADC1)
     int16_t adc1 = ads.readADC_SingleEnded(1);
-    
-    // Convert raw ADC value to Volts
     float voltage1 = adc1 * 0.000125; 
-    
-    // Prevent negative readings from slight electrical noise at 0V
     if (voltage1 < 0) voltage1 = 0;
     
-    // Linear conversion to decibels + calibration offset (FIX APPLIED HERE)
+    // Linear conversion to decibels + JSON offset
     float noiseDb = (voltage1 * 50.0) + noise_offset;
     
     Serial.printf("NOISE -> Voltage: %.3f V | SPL: %.1f dBA\n", voltage1, noiseDb);
-    
-    dtostrf(noiseDb, 5, 1, msgBuffer); mqttClient.publish((topic_base + "noise").c_str(), msgBuffer);
+    dtostrf(noiseDb, 5, 1, msgBuffer); 
+    mqttClient.publish((topic_base + "noise").c_str(), msgBuffer);
     
     Serial.println("--- Data published to MQTT ---");
   }
