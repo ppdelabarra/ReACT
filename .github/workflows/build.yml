@@ -91,8 +91,11 @@ jobs:
       - name: Commit changes
         run: |
           git config user.name "github-actions"
-          git config user.email "actions@github.com"
-
-          git add firmware version.json
-          git commit -m "Auto build + version bump" || echo "No changes to commit"
-          git push
+          git config user.email "github-actions@github.com"
+          
+          git add .
+          git commit -m "Auto build + version bump" || echo "No changes"
+          
+          git pull --rebase origin main
+          
+          git push origin main
