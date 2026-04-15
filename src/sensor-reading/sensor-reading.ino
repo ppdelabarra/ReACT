@@ -14,7 +14,7 @@
 #include <HTTPUpdate.h>
 #include <ArduinoJson.h>
 #include <Preferences.h> 
-#include <PubSubClient.h> // <-- MQTT IS BACK
+#include <PubSubClient.h> 
 
 // ================= GITHUB / OTA CONFIG =================
 const char* version_url = "https://raw.githubusercontent.com/ppdelabarra/ReACT/main/version.json";
@@ -58,7 +58,7 @@ Adafruit_ADS1115 ads;
 
 // ================= CALIBRATION GLOBALS =================
 float wind_zero = 0.0, wind_scale = 1.0, wind_exp = 1.0;
-float noise_ref = 0.01, noise_offset = 60.0;
+float noise_offset = 0.0; // <-- Deleted noise_ref and set default to 0.0
 
 // ================= OPT3001 CONFIG =================
 void configureOPT3001() {
@@ -112,11 +112,14 @@ void fetchCalibration() {
     if (!error) {
       if (doc["devices"].containsKey(deviceId)) {
         JsonObject dev = doc["devices"][deviceId];
+        
         wind_zero  = dev["wind"]["zeroVolts"] | 0.0;
         wind_scale = dev["wind"]["scale"] | 1.0;
         wind_exp   = dev["wind"]["exponent"] | 1.0;
-        noise_ref    = dev["noise"]["refVrms"] | 0.01;
-        noise_offset = dev["noise"]["dbOffset"] | 60.0;
+        
+        // <-- Removed noise_ref JSON pull
+        noise_offset = dev["noise"]["dbOffset"] | 0.0; 
+        
         Serial.println("Calibration loaded successfully ✅");
       } else {
         Serial.println("Device MAC not found in JSON. Using defaults ⚠️");
@@ -227,7 +230,7 @@ void setup() {
 
   if (ads.begin()) {
     Serial.println("ADS1115 detected ✅");
-    ads.setGain(GAIN_FOUR);
+    ads.setGain(GAIN_ONE);  // Allows reading up to +/- 4.096V
   }
 
   max31865.begin(MAX31865_4WIRE);
@@ -282,43 +285,49 @@ void loop() {
       max31865.clearFault();
     }
 
+    
     // Wind Processing (ADC0)
     int16_t adc0 = ads.readADC_SingleEnded(0);
-    float voltage0 = adc0 * 0.0000625;
-    float windSpeed = 0;
     
-    if (wind_scale != 0.0) {
-      float x = (voltage0 - wind_zero) / wind_scale;
-      windSpeed = (x < 0) ? 0 : pow(x, wind_exp);
-    }
-    Serial.printf("WIND -> Raw: %.3f V | Speed: %.2f m/s\n", voltage0, windSpeed);
-    dtostrf(windSpeed, 5, 2, msgBuffer); mqttClient.publish((topic_base + "wind").c_str(), msgBuffer);
+    // Convert to actual voltage 
+    float voltage0 = adc0 * 0.000125; 
 
+    // Simulate the 10-bit, 5V Arduino ADC reading the manufacturer's formula expects
+    float simulatedArduinoADC = (voltage0 / 5.0) * 1024.0;
+
+    float windSpeedMS = 0.0; // Final speed in meters per second
+    
+    if (wind_scale != 0.0) { // Protect against divide-by-zero
+      float x = (simulatedArduinoADC - wind_zero) / wind_scale;
+      
+      // Calculate MPH using the manufacturer exponent
+      float windMPH = (x < 0) ? 0 : pow(x, wind_exp);
+      
+      // Convert MPH to m/s 
+      windSpeedMS = windMPH * 0.44704;
+    }
+    
+    Serial.printf("WIND -> Raw: %.3f V | Sim ADC: %.1f | Speed: %.2f m/s\n", 
+                  voltage0, simulatedArduinoADC, windSpeedMS);
+                  
+    dtostrf(windSpeedMS, 5, 2, msgBuffer); 
+    mqttClient.publish((topic_base + "wind").c_str(), msgBuffer);
+
+    
     // Noise Processing (ADC1)
-    const int N_SAMPLES = 100;
-    float sum = 0, sumSq = 0;
-
-    for (int i = 0; i < N_SAMPLES; i++) {
-      float v = ads.readADC_SingleEnded(1) * 0.0000625;
-      sum += v;
-      sumSq += v * v;
-      delayMicroseconds(200);
-    }
-
-    float mean = sum / N_SAMPLES;
-    float variance = (sumSq / N_SAMPLES) - (mean * mean);
-    if (variance < 0) variance = 0;
-    float vrms = sqrt(variance);
-
-    float noiseDb = -1.0;
-    if (isfinite(vrms) && noise_ref >= 1e-6f) {
-      if (vrms < 1e-6f) vrms = 1e-6f;
-      float ratio = vrms / noise_ref;
-      if (ratio < 1e-6f) ratio = 1e-6f;
-      noiseDb = 20.0f * log10(ratio) + noise_offset;
-    }
+    int16_t adc1 = ads.readADC_SingleEnded(1);
     
-    Serial.printf("NOISE -> RMS: %.3f mV | SPL: %.1f dB\n", (vrms * 1000.0), noiseDb);
+    // Convert raw ADC value to Volts
+    float voltage1 = adc1 * 0.000125; 
+    
+    // Prevent negative readings from slight electrical noise at 0V
+    if (voltage1 < 0) voltage1 = 0;
+    
+    // Linear conversion to decibels + calibration offset (FIX APPLIED HERE)
+    float noiseDb = (voltage1 * 50.0) + noise_offset;
+    
+    Serial.printf("NOISE -> Voltage: %.3f V | SPL: %.1f dBA\n", voltage1, noiseDb);
+    
     dtostrf(noiseDb, 5, 1, msgBuffer); mqttClient.publish((topic_base + "noise").c_str(), msgBuffer);
     
     Serial.println("--- Data published to MQTT ---");
