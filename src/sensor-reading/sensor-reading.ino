@@ -135,6 +135,8 @@ void fetchCalibration() {
   https.setInsecure();
 
   http.begin(https, calibration_url);
+  // FIX: Allow redirect to GitHub CDN
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); 
 
   if (http.GET() == 200) {
 
@@ -171,6 +173,9 @@ void updateFirmware(String url) {
 
   WiFiClientSecure updateClient;
   updateClient.setInsecure();
+  
+  // FIX: Allow redirect to GitHub CDN for the bin file
+  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
   t_httpUpdate_return ret = httpUpdate.update(updateClient, url);
 
@@ -191,6 +196,9 @@ void checkForUpdate() {
 
   HTTPClient http;
   http.begin(https, version_url);
+  
+  // FIX: Allow redirect to GitHub CDN for the json file
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
   if (http.GET() == 200) {
 
@@ -222,6 +230,10 @@ float readWind() {
 
   int adc = ads.readADC_SingleEnded(0);
   float v = adc * 0.0000625;
+  
+  // FIX: Prevent divide-by-zero which causes "inf"
+  if (wind_scale == 0.0) return -1.0; 
+  
   float x = (v - wind_zero) / wind_scale;
 
   return (x < 0) ? 0 : pow(x, wind_exp);
@@ -256,6 +268,7 @@ void setup() {
   wm.autoConnect("ESP32_SETUP");
 
   deviceId = WiFi.macAddress();
+  Serial.println("MAC / Device ID: " + deviceId);
   topic_base = "sensor/" + deviceId + "/";
 
   espClient.setInsecure();
@@ -321,12 +334,16 @@ void loop() {
     dtostrf(globeT,5,2,msg); client.publish((topic_base + "globe").c_str(), msg);
     dtostrf(lux,6,0,msg); client.publish((topic_base + "lux").c_str(), msg);
 
-    Serial.println("Data sent");
+    // FEATURE: Display published values in Serial Monitor
+    Serial.printf("MQTT Data -> Wind: %.2f | Noise: %.1f dB | CO2: %d ppm | Temp: %.2f C | Hum: %.1f %% | Globe: %.2f C | Lux: %.0f \n", 
+                  wind, noiseDb, d.co2, temp, hum, globeT, lux);
   }
 
   // OTA periodic check (60s)
   if (millis() - lastOTAcheck > 60000) {
     lastOTAcheck = millis();
+    // FEATURE: Log when checking for updates
+    Serial.println("Running periodic OTA check..."); 
     checkForUpdate();
   }
 }
