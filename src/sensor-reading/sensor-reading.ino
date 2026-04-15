@@ -1,349 +1,295 @@
 // ================= INCLUDES =================
+#include <Wire.h>
+#include <Adafruit_ADS1X15.h>
+#include <Adafruit_MAX31865.h>
+#include <SparkFun_SCD4x_Arduino_Library.h>
+#include <ClosedCube_OPT3001.h>
+#include <math.h>
+
+// Network & OTA Includes
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <PubSubClient.h>
 #include <WiFiManager.h>
-#include <ArduinoOTA.h>
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
 #include <ArduinoJson.h>
-#include <Wire.h>
-#include <math.h>
-#include <Adafruit_ADS1X15.h>
 
-#include "scd41_sensor.h"
-#include "opt3001_sensor.h"
-#include "noise_sensor.h"
-#include "noise_processing.h"
-#include "max31865_sensor.h"
-
-// ================= CONFIG =================
-#define SIMULATION_MODE false
-
-const char* calibration_url =
-"https://raw.githubusercontent.com/ppdelabarra/ReACT/main/calibration.json";
-
-// ================= OTA =================
-const char* currentVersion = "0.0";
-const char* version_url =
-"https://raw.githubusercontent.com/ppdelabarra/ReACT/main/version.json";
-
-// ================= MQTT =================
-const char* mqtt_server = "7e43d9945d5748a782e8a2c3257f6743.s1.eu.hivemq.cloud";
-const int mqtt_port = 8883;
-const char* mqtt_user = "ReACT";
-const char* mqtt_pass = "ThermalComfort2026";
-
-// ================= GLOBALS =================
-WiFiClientSecure espClient;
-PubSubClient client(espClient);
+// ================= GITHUB / OTA CONFIG =================
+const char* currentVersion = "1.0"; // Update this when pushing new code
+const char* version_url = "https://raw.githubusercontent.com/ppdelabarra/ReACT/main/version.json";
+const char* calibration_url = "https://raw.githubusercontent.com/ppdelabarra/ReACT/main/calibration.json";
 
 String deviceId;
-String topic_base;
-String ota_topic;
-
+unsigned long lastSensorRead = 0;
 unsigned long lastOTAcheck = 0;
 
-// ================= SENSORS =================
-SCD41Sensor scd;
-OPT3001Sensor light;
-NoiseSensor noise;
-Adafruit_ADS1115 ads;
+// ================= I2C =================
+#define SDA_PIN 21
+#define SCL_PIN 22
 
+// ================= SENSORS =================
+// OPT3001
+#define OPT3001_ADDRESS 0x45
+ClosedCube_OPT3001 opt3001;
+
+// MAX31865
 #define MAX_CS   5
 #define MAX_MOSI 23
 #define MAX_MISO 19
 #define MAX_SCK  18
-MAX31865Sensor globe(MAX_CS, MAX_MOSI, MAX_MISO, MAX_SCK);
+#define RREF      430.0
+#define RNOMINAL  100.0
+Adafruit_MAX31865 max31865(MAX_CS, MAX_MOSI, MAX_MISO, MAX_SCK);
 
-float samples[100];
+// SCD41 & ADS1115
+SCD4x scd41;
+Adafruit_ADS1115 ads;
 
-// ================= CALIBRATION =================
-float wind_zero, wind_scale, wind_exp;
-float noise_ref, noise_offset;
-float lux_gain, lux_offset;
-float globe_offset;
-float scd_temp_offset, scd_hum_offset;
+// ================= CALIBRATION GLOBALS =================
+// Defaults provided to prevent math errors if Wi-Fi/JSON fails
+float wind_zero = 0.0, wind_scale = 1.0, wind_exp = 1.0;
+float noise_ref = 0.01, noise_offset = 60.0;
 
-// ================= MQTT OTA CALLBACK =================
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
+// ================= OPT3001 CONFIG =================
+void configureOPT3001() {
+  OPT3001_Config cfg;
+  cfg.RangeNumber = B1100;
+  cfg.ConvertionTime = B0;
+  cfg.Latch = B1;
+  cfg.ModeOfConversionOperation = B11;
 
-  String msg;
-
-  for (int i = 0; i < length; i++) {
-    msg += (char)payload[i];
-  }
-
-  Serial.println("MQTT: " + msg);
-
-  if (String(topic) == ota_topic) {
-    if (msg == "update") {
-      Serial.println("MQTT OTA trigger received");
-      checkForUpdate();
-    }
-  }
-}
-
-// ================= MQTT RECONNECT =================
-void reconnectMQTT() {
-
-  while (!client.connected()) {
-
-    String clientId = "Station-" + deviceId;
-
-    if (client.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
-
-      Serial.println("MQTT connected");
-
-      ota_topic = topic_base + "ota";
-      client.subscribe(ota_topic.c_str());
-
-    } else {
-      delay(3000);
-    }
+  OPT3001_ErrorCode err = opt3001.writeConfig(cfg);
+  if (err == NO_ERROR) {
+    Serial.println("OPT3001 configured ✅");
+  } else {
+    Serial.printf("OPT3001 config error: %d\n", err);
   }
 }
 
-// ================= AUTO DISCOVERY =================
-void publishDiscovery() {
-
-  StaticJsonDocument<256> doc;
-
-  doc["device"] = deviceId;
-  doc["type"] = "ReACT_station";
-
-  JsonArray sensors = doc.createNestedArray("sensors");
-  sensors.add("wind");
-  sensors.add("noise");
-  sensors.add("temp");
-  sensors.add("humidity");
-  sensors.add("co2");
-  sensors.add("globe");
-  sensors.add("lux");
-
-  char buffer[256];
-  serializeJson(doc, buffer);
-
-  client.publish("sensor/discovery", buffer, true);
-}
-
-// ================= CALIBRATION =================
+// ================= JSON CALIBRATION =================
 void fetchCalibration() {
-
-  HTTPClient http;
+  Serial.println("Fetching calibration from GitHub...");
+  
   WiFiClientSecure https;
   https.setInsecure();
-
+  HTTPClient http;
+  
   http.begin(https, calibration_url);
-  // FIX: Allow redirect to GitHub CDN
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); 
+  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS); // Crucial for GitHub
 
   if (http.GET() == 200) {
-
     StaticJsonDocument<4096> doc;
-    deserializeJson(doc, http.getString());
+    DeserializationError error = deserializeJson(doc, http.getString());
+    
+    if (!error) {
+      if (doc["devices"].containsKey(deviceId)) {
+        JsonObject dev = doc["devices"][deviceId];
 
-    JsonObject dev = doc["devices"][deviceId];
+        wind_zero  = dev["wind"]["zeroVolts"] | 0.0;
+        wind_scale = dev["wind"]["scale"] | 1.0;
+        wind_exp   = dev["wind"]["exponent"] | 1.0;
 
-    wind_zero  = dev["wind"]["zeroVolts"];
-    wind_scale = dev["wind"]["scale"];
-    wind_exp   = dev["wind"]["exponent"];
+        noise_ref    = dev["noise"]["refVrms"] | 0.01;
+        noise_offset = dev["noise"]["dbOffset"] | 60.0;
 
-    noise_ref    = dev["noise"]["refVrms"];
-    noise_offset = dev["noise"]["dbOffset"];
-
-    lux_gain   = dev["light"]["gain"];
-    lux_offset = dev["light"]["offset"];
-
-    globe_offset = dev["globe"]["offset"];
-
-    scd_temp_offset = dev["scd41"]["tempOffset"];
-    scd_hum_offset  = dev["scd41"]["humidityOffset"];
-
-    Serial.println("Calibration loaded");
+        Serial.println("Calibration loaded successfully ✅");
+      } else {
+        Serial.println("Device MAC not found in JSON. Using defaults ⚠️");
+      }
+    } else {
+      Serial.println("Failed to parse JSON ❌");
+    }
+  } else {
+    Serial.println("Failed to download calibration file ❌");
   }
-
   http.end();
 }
 
-// ================= OTA UPDATE =================
+// ================= OTA FIRMWARE UPDATE =================
 void updateFirmware(String url) {
-
-  Serial.println("Starting OTA...");
+  Serial.println("Starting OTA Download...");
 
   WiFiClientSecure updateClient;
   updateClient.setInsecure();
-  
-  // FIX: Allow redirect to GitHub CDN for the bin file
   httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
   t_httpUpdate_return ret = httpUpdate.update(updateClient, url);
 
   if (ret == HTTP_UPDATE_OK) {
-    Serial.println("OTA success → rebooting");
+    Serial.println("OTA success → rebooting ✅");
   } else if (ret == HTTP_UPDATE_NO_UPDATES) {
-    Serial.println("No update");
+    Serial.println("No update found.");
   } else {
-    Serial.printf("OTA failed: %d\n", httpUpdate.getLastError());
+    Serial.printf("OTA failed: %d ❌\n", httpUpdate.getLastError());
   }
 }
 
-// ================= VERSION CHECK =================
 void checkForUpdate() {
-
+  Serial.println("Checking for firmware updates...");
+  
   WiFiClientSecure https;
   https.setInsecure();
-
   HTTPClient http;
-  http.begin(https, version_url);
   
-  // FIX: Allow redirect to GitHub CDN for the json file
+  http.begin(https, version_url);
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
   if (http.GET() == 200) {
-
     StaticJsonDocument<512> doc;
-    deserializeJson(doc, http.getString());
+    if (!deserializeJson(doc, http.getString())) {
+      String latest = doc["version"];
+      String binUrl = doc["bin"];
 
-    String latest = doc["version"];
-    String bin = doc["bin"];
+      Serial.println("Current Version: " + String(currentVersion));
+      Serial.println("Latest Version : " + latest);
 
-    Serial.println("Current: " + String(currentVersion));
-    Serial.println("Latest: " + latest);
-
-    if (latest != currentVersion) {
-
-      Serial.println("New firmware found");
-
-      client.disconnect();
-      delay(1000);
-
-      updateFirmware(bin);
+      if (latest != currentVersion) {
+        Serial.println("New firmware available! Initiating update...");
+        delay(1000);
+        updateFirmware(binUrl);
+      } else {
+        Serial.println("Firmware is up to date.");
+      }
     }
+  } else {
+    Serial.println("Failed to check for updates ❌");
   }
-
   http.end();
-}
-
-// ================= WIND =================
-float readWind() {
-
-  int adc = ads.readADC_SingleEnded(0);
-  float v = adc * 0.0000625;
-  
-  // FIX: Prevent divide-by-zero which causes "inf"
-  if (wind_scale == 0.0) return -1.0; 
-  
-  float x = (v - wind_zero) / wind_scale;
-
-  return (x < 0) ? 0 : pow(x, wind_exp);
-}
-
-// ================= NOISE =================
-float readNoise() {
-
-  noise.sample(samples, 100);
-  NoiseData nd = processNoise(samples, 100);
-
-  float vrms = nd.vrms;
-
-  if (!isfinite(vrms)) return -1;
-  if (vrms < 1e-6f) vrms = 1e-6f;
-  if (noise_ref < 1e-6f) return -1;
-
-  float ratio = vrms / noise_ref;
-  if (ratio < 1e-6f) ratio = 1e-6f;
-
-  return 20.0f * log10f(ratio) + noise_offset;
 }
 
 // ================= SETUP =================
 void setup() {
-
   Serial.begin(115200);
+  delay(1000);
 
+  Serial.println("\n=== SYSTEM BOOT ===");
+
+  // --- Wi-Fi Setup ---
   WiFi.mode(WIFI_STA);
-
   WiFiManager wm;
-  wm.autoConnect("ESP32_SETUP");
+  // wm.resetSettings(); // Uncomment to wipe saved Wi-Fi for testing
+  Serial.println("Connecting to Wi-Fi...");
+  bool connected = wm.autoConnect("ReACT_Station_Setup");
+  
+  if(connected) {
+    Serial.println("Wi-Fi Connected ✅");
+  } else {
+    Serial.println("Wi-Fi Connection Failed ❌");
+  }
 
   deviceId = WiFi.macAddress();
-  Serial.println("MAC / Device ID: " + deviceId);
-  topic_base = "sensor/" + deviceId + "/";
+  Serial.println("Device MAC ID: " + deviceId);
 
-  espClient.setInsecure();
-  client.setServer(mqtt_server, mqtt_port);
-  client.setCallback(mqttCallback);
-
-  ArduinoOTA.begin();
-
-  Wire.begin(21, 22);
-
-  scd.begin(Wire);
-  light.begin();
-  ads.begin();
-  ads.setGain(GAIN_FOUR);
-  globe.begin();
-
+  // --- Fetch Cloud Configurations ---
   fetchCalibration();
-  reconnectMQTT();
-  publishDiscovery();
+  checkForUpdate();
 
-  client.publish((topic_base + "status").c_str(), "online", true);
+  Serial.println("\n=== SENSOR INITIALIZATION ===");
 
-  Serial.println("System ready");
+  Wire.begin(SDA_PIN, SCL_PIN);
+
+  // --- SCD41 ---
+  if (scd41.begin(Wire)) {
+    Serial.println("SCD41 detected ✅");
+    scd41.startPeriodicMeasurement();
+  } else {
+    Serial.println("SCD41 NOT detected ❌");
+  }
+
+  // --- OPT3001 ---
+  opt3001.begin(OPT3001_ADDRESS);
+  configureOPT3001();
+
+  // --- ADS1115 ---
+  if (ads.begin()) {
+    Serial.println("ADS1115 detected ✅");
+    ads.setGain(GAIN_FOUR);  // ±1.024V range
+  } else {
+    Serial.println("ADS1115 NOT detected ❌");
+  }
+
+  // --- MAX31865 ---
+  max31865.begin(MAX31865_4WIRE);
+  Serial.println("MAX31865 initialized ✅");
+
+  Serial.println("================================\n");
 }
 
 // ================= LOOP =================
 void loop() {
+  unsigned long currentMillis = millis();
 
-  ArduinoOTA.handle();
+  // --- Read Sensors Every 5 Seconds ---
+  if (currentMillis - lastSensorRead >= 5000) {
+    lastSensorRead = currentMillis;
+    
+    Serial.println("\n--- SENSOR READINGS ---");
 
-  if (!client.connected()) reconnectMQTT();
-  client.loop();
+    // SCD41 (CO2, Temp, Hum)
+    if (scd41.getDataReadyStatus() && scd41.readMeasurement()) {
+      Serial.printf("SCD41 -> Temp: %.2f °C | Hum: %.1f %% | CO2: %d ppm\n", 
+                    scd41.getTemperature(), scd41.getHumidity(), scd41.getCO2());
+    } else {
+      Serial.println("SCD41 -> Not ready or failed");
+    }
 
-  static unsigned long last = 0;
-  static unsigned long lastOTAcheck = 0;
+    // OPT3001 (Light)
+    OPT3001 result = opt3001.readResult();
+    if (result.error == NO_ERROR) {
+      Serial.printf("OPT3001 -> Illuminance: %.2f lux\n", result.lux);
+    }
 
-  if (millis() - last > 2000) {
+    // MAX31865 (Globe Temp)
+    float globeTemp = max31865.temperature(RNOMINAL, RREF);
+    uint8_t fault = max31865.readFault();
+    Serial.printf("MAX31865 -> Globe Temp: %.2f °C\n", globeTemp);
+    if (fault) {
+      Serial.printf("MAX31865 -> Fault: 0x%X\n", fault);
+      max31865.clearFault();
+    }
 
-    last = millis();
+    // Wind Processing (ADC0)
+    int16_t adc0 = ads.readADC_SingleEnded(0);
+    float voltage0 = adc0 * 0.0000625;
+    float windSpeed = 0;
+    
+    if (wind_scale != 0.0) { // Protect against divide-by-zero
+      float x = (voltage0 - wind_zero) / wind_scale;
+      windSpeed = (x < 0) ? 0 : pow(x, wind_exp);
+    }
+    Serial.printf("WIND -> Raw: %.3f V | Speed: %.2f m/s\n", voltage0, windSpeed);
 
-    float wind = readWind();
-    float noiseDb = readNoise();
+    // Noise Processing (ADC1)
+    const int N_SAMPLES = 100;
+    float sum = 0, sumSq = 0;
 
-    SCD41Data d;
-    scd.read(d);
+    for (int i = 0; i < N_SAMPLES; i++) {
+      float v = ads.readADC_SingleEnded(1) * 0.0000625;
+      sum += v;
+      sumSq += v * v;
+      delayMicroseconds(200);
+    }
 
-    float temp = d.temp + scd_temp_offset;
-    float hum  = d.hum + scd_hum_offset;
+    float mean = sum / N_SAMPLES;
+    float variance = (sumSq / N_SAMPLES) - (mean * mean);
+    if (variance < 0) variance = 0;
+    float vrms = sqrt(variance);
 
-    if (hum < 0) hum = 0;
-    if (hum > 100) hum = 100;
-
-    float globeT = globe.readTemperature() + globe_offset;
-    float lux = light.readLux() * lux_gain + lux_offset;
-
-    char msg[32];
-
-    dtostrf(wind,5,2,msg); client.publish((topic_base + "wind").c_str(), msg);
-    dtostrf(noiseDb,5,1,msg); client.publish((topic_base + "noise").c_str(), msg);
-    dtostrf(d.co2,6,0,msg); client.publish((topic_base + "co2").c_str(), msg);
-    dtostrf(temp,5,2,msg); client.publish((topic_base + "temp").c_str(), msg);
-    dtostrf(hum,5,1,msg); client.publish((topic_base + "humidity").c_str(), msg);
-    dtostrf(globeT,5,2,msg); client.publish((topic_base + "globe").c_str(), msg);
-    dtostrf(lux,6,0,msg); client.publish((topic_base + "lux").c_str(), msg);
-
-    // FEATURE: Display published values in Serial Monitor
-    Serial.printf("MQTT Data -> Wind: %.2f | Noise: %.1f dB | CO2: %d ppm | Temp: %.2f C | Hum: %.1f %% | Globe: %.2f C | Lux: %.0f \n", 
-                  wind, noiseDb, d.co2, temp, hum, globeT, lux);
+    float noiseDb = -1.0;
+    if (isfinite(vrms) && noise_ref >= 1e-6f) {
+      if (vrms < 1e-6f) vrms = 1e-6f;
+      float ratio = vrms / noise_ref;
+      if (ratio < 1e-6f) ratio = 1e-6f;
+      noiseDb = 20.0f * log10(ratio) + noise_offset;
+    }
+    
+    Serial.printf("NOISE -> RMS: %.3f mV | SPL: %.1f dB\n", (vrms * 1000.0), noiseDb);
+    Serial.println("------------------------");
   }
 
-  // OTA periodic check (60s)
-  if (millis() - lastOTAcheck > 60000) {
-    lastOTAcheck = millis();
-    // FEATURE: Log when checking for updates
-    Serial.println("Running periodic OTA check..."); 
+  // --- Check for OTA Every 60 Seconds ---
+  if (currentMillis - lastOTAcheck >= 60000) {
+    lastOTAcheck = currentMillis;
     checkForUpdate();
   }
 }
