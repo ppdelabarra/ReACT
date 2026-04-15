@@ -1,4 +1,4 @@
 {
-  "version": "0.23",
+  "version": "0.24",
   "bin": "https://raw.githubusercontent.com/ppdelabarra/ReACT/main/firmware/sensor-reading.ino.bin"
 }
