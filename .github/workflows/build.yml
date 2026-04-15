@@ -45,6 +45,8 @@ jobs:
           arduino-cli lib install "Adafruit MAX31865 library"
           arduino-cli lib install "SparkFun SCD4x Arduino Library"
           arduino-cli lib install "ClosedCube OPT3001"
+          arduino-cli lib install "Wire"
+          arduino-cli lib install "math"
 
       - name: Debug file structure (temporary)
         run: |
