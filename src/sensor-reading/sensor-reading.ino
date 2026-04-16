@@ -13,8 +13,8 @@
 #include <HTTPClient.h>
 #include <HTTPUpdate.h>
 #include <ArduinoJson.h>
-#include <Preferences.h> 
-#include <PubSubClient.h> 
+#include <Preferences.h>
+#include <PubSubClient.h>
 
 // ================= GITHUB / OTA CONFIG =================
 const char* version_url = "https://raw.githubusercontent.com/ppdelabarra/ReACT/main/version.json";
@@ -58,11 +58,10 @@ SCD4x scd41;
 Adafruit_ADS1115 ads;
 
 // ================= CALIBRATION GLOBALS =================
-float wind_zero = 0.0, wind_scale = 1.0, wind_exp = 1.0;
-float wind_temp_ref = 25.0;
-float wind_temp_exp = 0.5;
+// Rev P wind sensor: only zero-wind voltage is needed for the new regression
+float wind_zero = 1.346f;
 
-float noise_offset = 0.0; 
+float noise_offset = 0.0;
 float scd_temp_offset = 0.0;
 float scd_hum_offset = 0.0;
 
@@ -79,7 +78,7 @@ void configureOPT3001() {
 // ================= MQTT CALLBACK =================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String msg;
-  for (int i = 0; i < length; i++) msg += (char)payload[i];
+  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
 
   if (String(topic) == command_topic && msg == "calibrate_co2") {
     scd41.stopPeriodicMeasurement();
@@ -103,6 +102,28 @@ void reconnectMQTT() {
   }
 }
 
+// ================= REV P WIND REGRESSION =================
+// outVolts: OUT voltage from Rev P
+// tempC: TMP-derived temperature in Celsius
+// zeroWindVolts: calibrated zero-wind OUT voltage
+float computeWindMS_RevP(float outVolts, float tempC, float zeroWindVolts) {
+  // Modern Device Rev P regression constants
+  const float A = 3.038517f;
+  const float B = 0.115157f;
+  const float C = 3.009364f;
+  const float D = 0.087288f;
+
+  // Prevent invalid fractional power for very low/negative temperatures
+  if (tempC < 0.1f) tempC = 0.1f;
+
+  float x = ((outVolts - zeroWindVolts) / (A * pow(tempC, B))) / D;
+
+  if (x <= 0.0f) return 0.0f;
+
+  float windMPH = pow(x, C);
+  return windMPH * 0.44704f; // mph -> m/s
+}
+
 // ================= JSON CALIBRATION =================
 void fetchCalibration() {
   WiFiClientSecure https;
@@ -112,19 +133,18 @@ void fetchCalibration() {
   http.begin(https, calibration_url);
   if (http.GET() == 200) {
     StaticJsonDocument<4096> doc;
-    if (!deserializeJson(doc, http.getString())) {
+    String payload = http.getString();
+
+    if (!deserializeJson(doc, payload)) {
       if (doc["devices"].containsKey(deviceId)) {
         JsonObject dev = doc["devices"][deviceId];
 
-        wind_zero  = dev["wind"]["zeroVolts"] | 0.0;
-        wind_scale = dev["wind"]["scale"] | 1.0;
-        wind_exp   = dev["wind"]["exponent"] | 1.0;
-        wind_temp_ref = dev["wind"]["tempRef"] | 25.0;
-        wind_temp_exp = dev["wind"]["tempExponent"] | 0.5;
+        // New Rev P model only needs zeroVolts
+        wind_zero = dev["wind"]["zeroVolts"] | 1.346f;
 
-        noise_offset = dev["noise"]["dbOffset"] | 0.0;
-        scd_temp_offset = dev["scd41"]["tempOffset"] | 0.0;
-        scd_hum_offset  = dev["scd41"]["humidityOffset"] | 0.0;
+        noise_offset   = dev["noise"]["dbOffset"] | 0.0f;
+        scd_temp_offset = dev["scd41"]["tempOffset"] | 0.0f;
+        scd_hum_offset  = dev["scd41"]["humidityOffset"] | 0.0f;
       }
     }
   }
@@ -159,63 +179,66 @@ void setup() {
   configureOPT3001();
 
   ads.begin();
-  ads.setGain(GAIN_ONE);
+  ads.setGain(GAIN_ONE);   // ADS1115: 0.125 mV/bit for single-ended conversion
 
   max31865.begin(MAX31865_4WIRE);
+
+  Serial.println("System started");
+  Serial.print("Device ID: ");
+  Serial.println(deviceId);
+  Serial.print("Wind zero voltage: ");
+  Serial.println(wind_zero, 4);
 }
 
 // ================= LOOP =================
 void loop() {
-
   if (!mqttClient.connected()) reconnectMQTT();
   mqttClient.loop();
 
   if (millis() - lastSensorRead >= 5000) {
     lastSensorRead = millis();
 
-    char msgBuffer[16];
+    char msgBuffer[20];
 
-    // --- SCD41 ---
+    // ================= SCD41 =================
     if (scd41.getDataReadyStatus() && scd41.readMeasurement()) {
       float temp = scd41.getTemperature() + scd_temp_offset;
-      float hum = scd41.getHumidity() + scd_hum_offset;
+      float hum  = scd41.getHumidity() + scd_hum_offset;
       uint16_t co2 = scd41.getCO2();
 
-      dtostrf(temp, 5, 2, msgBuffer); mqttClient.publish((topic_base + "temp").c_str(), msgBuffer);
-      dtostrf(hum, 5, 1, msgBuffer);  mqttClient.publish((topic_base + "humidity").c_str(), msgBuffer);
-      dtostrf(co2, 6, 0, msgBuffer);  mqttClient.publish((topic_base + "co2").c_str(), msgBuffer);
+      dtostrf(temp, 5, 2, msgBuffer);
+      mqttClient.publish((topic_base + "temp").c_str(), msgBuffer);
+
+      dtostrf(hum, 5, 1, msgBuffer);
+      mqttClient.publish((topic_base + "humidity").c_str(), msgBuffer);
+
+      snprintf(msgBuffer, sizeof(msgBuffer), "%u", co2);
+      mqttClient.publish((topic_base + "co2").c_str(), msgBuffer);
     }
 
-    // --- LIGHT ---
+    // ================= LIGHT =================
     OPT3001 result = opt3001.readResult();
     dtostrf(result.lux, 6, 0, msgBuffer);
     mqttClient.publish((topic_base + "lux").c_str(), msgBuffer);
 
-    // --- GLOBE ---
+    // ================= GLOBE =================
     float globeTemp = max31865.temperature(RNOMINAL, RREF);
     dtostrf(globeTemp, 5, 2, msgBuffer);
     mqttClient.publish((topic_base + "globe").c_str(), msgBuffer);
 
-    // ================= WIND SENSOR =================
+    // ================= WIND SENSOR (REV P NEW REGRESSION) =================
+    // OUT = A0, TMP = A1
     int16_t adc0 = ads.readADC_SingleEnded(0);
-    float voltage0 = adc0 * 0.000125;
-    float simADC = (voltage0 / 5.0) * 1024.0;
-
     int16_t adc1 = ads.readADC_SingleEnded(1);
-    float voltageTMP = adc1 * 0.000125;
-    float tempTMP = (voltageTMP - 0.400) / 0.0195;
 
-    float windSpeedMS = 0.0;
+    float voltageOUT = adc0 * 0.000125f;   // GAIN_ONE => 125 uV/bit
+    float voltageTMP = adc1 * 0.000125f;
 
-    if (wind_scale != 0.0) {
-      float x = (simADC - wind_zero) / wind_scale;
-      float windMPH = (x < 0) ? 0 : pow(x, wind_exp);
+    // TMP formula from sensor documentation
+    float tempTMP = (voltageTMP - 0.400f) / 0.0195f;
 
-      float tempFactor = pow((tempTMP + 273.15) / (wind_temp_ref + 273.15), wind_temp_exp);
-      windMPH *= tempFactor;
-
-      windSpeedMS = windMPH * 0.44704;
-    }
+    // Compute wind speed in m/s with Rev P regression
+    float windSpeedMS = computeWindMS_RevP(voltageOUT, tempTMP, wind_zero);
 
     dtostrf(windSpeedMS, 5, 2, msgBuffer);
     mqttClient.publish((topic_base + "wind").c_str(), msgBuffer);
@@ -223,10 +246,35 @@ void loop() {
     dtostrf(tempTMP, 5, 2, msgBuffer);
     mqttClient.publish((topic_base + "wind_temp").c_str(), msgBuffer);
 
-    // --- NOISE ---
+    // Optional raw debug channels
+    dtostrf(voltageOUT, 5, 3, msgBuffer);
+    mqttClient.publish((topic_base + "wind_out_volts").c_str(), msgBuffer);
+
+    dtostrf(voltageTMP, 5, 3, msgBuffer);
+    mqttClient.publish((topic_base + "wind_tmp_volts").c_str(), msgBuffer);
+
+    // Serial debug
+    Serial.print("OUT=");
+    Serial.print(voltageOUT, 4);
+    Serial.print(" V, TMP=");
+    Serial.print(voltageTMP, 4);
+    Serial.print(" V, Temp=");
+    Serial.print(tempTMP, 2);
+    Serial.print(" C, Wind=");
+    Serial.print(windSpeedMS, 2);
+    Serial.println(" m/s");
+
+    if (voltageTMP < 0.30f || voltageTMP > 1.50f) {
+      Serial.println("[WARN] Wind TMP voltage out of expected range");
+    }
+    if (voltageOUT < 0.20f || voltageOUT > 2.30f) {
+      Serial.println("[WARN] Wind OUT voltage unusual for still/low wind");
+    }
+
+    // ================= NOISE =================
     int16_t adc2 = ads.readADC_SingleEnded(2);
-    float voltage2 = adc2 * 0.000125;
-    float noiseDb = (voltage2 * 50.0) + noise_offset;
+    float voltage2 = adc2 * 0.000125f;
+    float noiseDb = (voltage2 * 50.0f) + noise_offset;
 
     dtostrf(noiseDb, 5, 1, msgBuffer);
     mqttClient.publish((topic_base + "noise").c_str(), msgBuffer);
