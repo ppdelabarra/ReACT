@@ -201,8 +201,8 @@ void loop() {
     float voltage0 = adc0 * 0.000125;
     float simADC = (voltage0 / 5.0) * 1024.0;
 
-    int16_t adc2 = ads.readADC_SingleEnded(2);
-    float voltageTMP = adc2 * 0.000125;
+    int16_t adc1 = ads.readADC_SingleEnded(1);
+    float voltageTMP = adc1 * 0.000125;
     float tempTMP = (voltageTMP - 0.400) / 0.0195;
 
     float windSpeedMS = 0.0;
@@ -224,9 +224,9 @@ void loop() {
     mqttClient.publish((topic_base + "wind_temp").c_str(), msgBuffer);
 
     // --- NOISE ---
-    int16_t adc1 = ads.readADC_SingleEnded(1);
-    float voltage1 = adc1 * 0.000125;
-    float noiseDb = (voltage1 * 50.0) + noise_offset;
+    int16_t adc2 = ads.readADC_SingleEnded(2);
+    float voltage2 = adc2 * 0.000125;
+    float noiseDb = (voltage2 * 50.0) + noise_offset;
 
     dtostrf(noiseDb, 5, 1, msgBuffer);
     mqttClient.publish((topic_base + "noise").c_str(), msgBuffer);
