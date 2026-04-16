@@ -59,7 +59,7 @@ Adafruit_ADS1115 ads;
 
 // ================= CALIBRATION GLOBALS =================
 // Rev P wind sensor: only zero-wind voltage is needed for the new regression
-float wind_zero = 1.346f;
+float wind_zero = 1.1f;
 
 float noise_offset = 0.0;
 float scd_temp_offset = 0.0;
