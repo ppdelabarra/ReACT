@@ -2,7 +2,7 @@
   "devices": {
     "F4:2D:C9:70:B9:88": {
       "wind": {
-        "zeroVolts": 264.0,
+        "zeroVolts": 1.2,
         "scale": 85.6814,
         "exponent": 3.36814,
         "tempRef": 25.0,
