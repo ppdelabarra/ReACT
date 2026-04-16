@@ -59,6 +59,9 @@ Adafruit_ADS1115 ads;
 
 // ================= CALIBRATION GLOBALS =================
 float wind_zero = 0.0, wind_scale = 1.0, wind_exp = 1.0;
+float wind_temp_ref = 25.0;
+float wind_temp_exp = 0.5;
+
 float noise_offset = 0.0; 
 float scd_temp_offset = 0.0;
 float scd_hum_offset = 0.0;
@@ -70,37 +73,18 @@ void configureOPT3001() {
   cfg.ConvertionTime = B0;
   cfg.Latch = B1;
   cfg.ModeOfConversionOperation = B11;
-
-  OPT3001_ErrorCode err = opt3001.writeConfig(cfg);
-  if (err == NO_ERROR) {
-    Serial.println("OPT3001 configured ✅");
-  } else {
-    Serial.printf("OPT3001 config error: %d\n", err);
-  }
+  opt3001.writeConfig(cfg);
 }
 
-// ================= MQTT CALLBACK (CO2 CALIBRATION) =================
+// ================= MQTT CALLBACK =================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String msg;
-  for (int i = 0; i < length; i++) {
-    msg += (char)payload[i];
-  }
-  
-  Serial.println("MQTT Command Received: " + msg);
+  for (int i = 0; i < length; i++) msg += (char)payload[i];
 
-  // If we receive the exact string "calibrate_co2" on the command topic
   if (String(topic) == command_topic && msg == "calibrate_co2") {
-    Serial.println("Forcing CO2 Hardware Calibration to 400 ppm...");
-    
     scd41.stopPeriodicMeasurement();
-    delay(500); // Wait for sensor to stop
-    
-    if (scd41.performForcedRecalibration(400)) {
-      Serial.println("CO2 FRC Successful! ✅");
-    } else {
-      Serial.println("CO2 FRC Failed! ❌");
-    }
-    
+    delay(500);
+    scd41.performForcedRecalibration(400);
     delay(400);
     scd41.startPeriodicMeasurement();
   }
@@ -109,20 +93,11 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 // ================= MQTT RECONNECT =================
 void reconnectMQTT() {
   while (!mqttClient.connected()) {
-    Serial.print("Connecting to MQTT...");
     String clientId = "Station-" + deviceId;
-    
     if (mqttClient.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
-      Serial.println(" Connected! ✅");
-      
-      // Announce we are online and subscribe to the command topic
       mqttClient.publish((topic_base + "status").c_str(), "online", true);
       mqttClient.subscribe(command_topic.c_str());
-      
     } else {
-      Serial.print(" Failed, rc=");
-      Serial.print(mqttClient.state());
-      Serial.println(" Trying again in 3 seconds...");
       delay(3000);
     }
   }
@@ -130,90 +105,26 @@ void reconnectMQTT() {
 
 // ================= JSON CALIBRATION =================
 void fetchCalibration() {
-  Serial.println("Fetching calibration from GitHub...");
   WiFiClientSecure https;
   https.setInsecure();
   HTTPClient http;
-  
-  http.begin(https, calibration_url);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
 
-  int httpCode = http.GET();
-  if (httpCode == 200) {
+  http.begin(https, calibration_url);
+  if (http.GET() == 200) {
     StaticJsonDocument<4096> doc;
-    DeserializationError error = deserializeJson(doc, http.getString());
-    
-    if (!error) {
+    if (!deserializeJson(doc, http.getString())) {
       if (doc["devices"].containsKey(deviceId)) {
         JsonObject dev = doc["devices"][deviceId];
-        
-        // Wind & Noise
+
         wind_zero  = dev["wind"]["zeroVolts"] | 0.0;
         wind_scale = dev["wind"]["scale"] | 1.0;
         wind_exp   = dev["wind"]["exponent"] | 1.0;
-        noise_offset = dev["noise"]["dbOffset"] | 0.0; 
-        
-        // SCD41 Software Offsets
+        wind_temp_ref = dev["wind"]["tempRef"] | 25.0;
+        wind_temp_exp = dev["wind"]["tempExponent"] | 0.5;
+
+        noise_offset = dev["noise"]["dbOffset"] | 0.0;
         scd_temp_offset = dev["scd41"]["tempOffset"] | 0.0;
         scd_hum_offset  = dev["scd41"]["humidityOffset"] | 0.0;
-        
-        Serial.println("Calibration loaded successfully ✅");
-      } else {
-        Serial.println("Device MAC not found in JSON. Using defaults ⚠️");
-      }
-    } else {
-      Serial.println("Failed to parse JSON ❌");
-    }
-  } else {
-    Serial.printf("Failed to download calibration file ❌ HTTP Code: %d\n", httpCode);
-  }
-  http.end();
-}
-
-// ================= OTA FIRMWARE UPDATE =================
-void updateFirmware(String url, String newVersion) {
-  Serial.println("Starting OTA Download from: " + url);
-  WiFiClientSecure updateClient;
-  updateClient.setInsecure();
-  httpUpdate.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  httpUpdate.rebootOnUpdate(false);
-
-  t_httpUpdate_return ret = httpUpdate.update(updateClient, url);
-
-  if (ret == HTTP_UPDATE_OK) {
-    preferences.putString("fw_version", newVersion);
-    Serial.println("OTA success! Version officially updated to " + newVersion + " ✅");
-    delay(1000);
-    ESP.restart(); 
-  } else {
-    Serial.printf("OTA failed: %d ❌\n", httpUpdate.getLastError());
-  }
-}
-
-void checkForUpdate() {
-  Serial.println("Checking for firmware updates...");
-  WiFiClientSecure https;
-  https.setInsecure();
-  HTTPClient http;
-  
-  http.begin(https, version_url);
-  http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-
-  if (http.GET() == 200) {
-    StaticJsonDocument<512> doc;
-    if (!deserializeJson(doc, http.getString())) {
-      String latest = doc["version"];
-      String binUrl = doc["bin"];
-
-      Serial.println("Device Version: " + currentVersion);
-      Serial.println("GitHub Version: " + latest);
-
-      if (latest != currentVersion) {
-        Serial.println("Versions do not match. Initiating update...");
-        delay(1000);
-        updateFirmware(binUrl, latest);
-      } else {
-        Serial.println("Firmware is up to date.");
       }
     }
   }
@@ -223,151 +134,101 @@ void checkForUpdate() {
 // ================= SETUP =================
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  preferences.begin("react_system", false);
 
-  Serial.println("\n=== SYSTEM BOOT ===");
-
-  // --- Initialize Memory & Load Version ---
-  preferences.begin("react_system", false); 
-  currentVersion = preferences.getString("fw_version", "0.0"); 
-  Serial.println("Running Firmware Version: " + currentVersion);
-
-  // --- Wi-Fi Setup ---
   WiFi.mode(WIFI_STA);
   WiFiManager wm;
-  Serial.println("Connecting to Wi-Fi...");
-  if(wm.autoConnect("ReACT_Station_Setup")) {
-    Serial.println("Wi-Fi Connected ✅");
-  } else {
-    Serial.println("Wi-Fi Connection Failed ❌");
-  }
+  wm.autoConnect("ReACT_Station_Setup");
 
-  // --- Device & Topics ---
   deviceId = WiFi.macAddress();
-  Serial.println("Device MAC ID: " + deviceId);
   topic_base = "sensor/" + deviceId + "/";
   command_topic = topic_base + "command";
 
-  // --- MQTT Setup ---
-  espClient.setInsecure(); // Required for HiveMQ TLS
+  espClient.setInsecure();
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(mqttCallback);
 
-  // --- Fetch Cloud Configurations ---
   fetchCalibration();
-  checkForUpdate();
 
-  Serial.println("\n=== SENSOR INITIALIZATION ===");
   Wire.begin(SDA_PIN, SCL_PIN);
 
-  if (scd41.begin(Wire)) {
-    Serial.println("SCD41 detected ✅");
-    scd41.startPeriodicMeasurement();
-  }
-  
+  scd41.begin(Wire);
+  scd41.startPeriodicMeasurement();
+
   opt3001.begin(OPT3001_ADDRESS);
   configureOPT3001();
 
-  if (ads.begin()) {
-    Serial.println("ADS1115 detected ✅");
-    ads.setGain(GAIN_ONE);  // Allows reading up to +/- 4.096V
-  }
+  ads.begin();
+  ads.setGain(GAIN_ONE);
 
   max31865.begin(MAX31865_4WIRE);
-  Serial.println("MAX31865 initialized ✅");
-  Serial.println("================================\n");
 }
 
 // ================= LOOP =================
 void loop() {
-  // Keep MQTT Alive
-  if (!mqttClient.connected()) {
-    reconnectMQTT();
-  }
+
+  if (!mqttClient.connected()) reconnectMQTT();
   mqttClient.loop();
 
-  unsigned long currentMillis = millis();
+  if (millis() - lastSensorRead >= 5000) {
+    lastSensorRead = millis();
 
-  // --- Read Sensors Every 5 Seconds ---
-  if (currentMillis - lastSensorRead >= 5000) {
-    lastSensorRead = currentMillis;
-    
-    Serial.println("\n--- SENSOR READINGS ---");
-    char msgBuffer[16]; // Buffer for formatting numbers to strings
+    char msgBuffer[16];
 
-    // SCD41 (CO2, Temp, Hum)
+    // --- SCD41 ---
     if (scd41.getDataReadyStatus() && scd41.readMeasurement()) {
-      
-      // Apply the JSON Software Offsets here!
       float temp = scd41.getTemperature() + scd_temp_offset;
       float hum = scd41.getHumidity() + scd_hum_offset;
-      
-      // Prevent humidity from jumping out of real-world bounds due to offsets
-      if (hum < 0) hum = 0;
-      if (hum > 100) hum = 100;
-      
-      uint16_t co2 = scd41.getCO2(); // CO2 is calibrated via hardware command
-      
-      Serial.printf("SCD41 -> Temp: %.2f °C | Hum: %.1f %% | CO2: %d ppm\n", temp, hum, co2);
-      
+      uint16_t co2 = scd41.getCO2();
+
       dtostrf(temp, 5, 2, msgBuffer); mqttClient.publish((topic_base + "temp").c_str(), msgBuffer);
       dtostrf(hum, 5, 1, msgBuffer);  mqttClient.publish((topic_base + "humidity").c_str(), msgBuffer);
       dtostrf(co2, 6, 0, msgBuffer);  mqttClient.publish((topic_base + "co2").c_str(), msgBuffer);
     }
 
-    // OPT3001 (Light)
+    // --- LIGHT ---
     OPT3001 result = opt3001.readResult();
-    if (result.error == NO_ERROR) {
-      Serial.printf("OPT3001 -> Illuminance: %.2f lux\n", result.lux);
-      dtostrf(result.lux, 6, 0, msgBuffer); mqttClient.publish((topic_base + "lux").c_str(), msgBuffer);
-    }
+    dtostrf(result.lux, 6, 0, msgBuffer);
+    mqttClient.publish((topic_base + "lux").c_str(), msgBuffer);
 
-    // MAX31865 (Globe Temp)
+    // --- GLOBE ---
     float globeTemp = max31865.temperature(RNOMINAL, RREF);
-    uint8_t fault = max31865.readFault();
-    Serial.printf("MAX31865 -> Globe Temp: %.2f °C\n", globeTemp);
-    if (!fault) {
-      dtostrf(globeTemp, 5, 2, msgBuffer); mqttClient.publish((topic_base + "globe").c_str(), msgBuffer);
-    } else {
-      max31865.clearFault();
-    }
-    
-    // Wind Processing (ADC0)
+    dtostrf(globeTemp, 5, 2, msgBuffer);
+    mqttClient.publish((topic_base + "globe").c_str(), msgBuffer);
+
+    // ================= WIND SENSOR =================
     int16_t adc0 = ads.readADC_SingleEnded(0);
-    float voltage0 = adc0 * 0.000125; 
-    float simulatedArduinoADC = (voltage0 / 5.0) * 1024.0;
-    float windSpeedMS = 0.0; 
-    
-    if (wind_scale != 0.0) { 
-      float x = (simulatedArduinoADC - wind_zero) / wind_scale;
+    float voltage0 = adc0 * 0.000125;
+    float simADC = (voltage0 / 5.0) * 1024.0;
+
+    int16_t adc2 = ads.readADC_SingleEnded(2);
+    float voltageTMP = adc2 * 0.000125;
+    float tempTMP = (voltageTMP - 0.400) / 0.0195;
+
+    float windSpeedMS = 0.0;
+
+    if (wind_scale != 0.0) {
+      float x = (simADC - wind_zero) / wind_scale;
       float windMPH = (x < 0) ? 0 : pow(x, wind_exp);
+
+      float tempFactor = pow((tempTMP + 273.15) / (wind_temp_ref + 273.15), wind_temp_exp);
+      windMPH *= tempFactor;
+
       windSpeedMS = windMPH * 0.44704;
     }
-    
-    Serial.printf("WIND -> Raw: %.3f V | Sim ADC: %.1f | Speed: %.2f m/s\n", 
-                  voltage0, simulatedArduinoADC, windSpeedMS);
-    dtostrf(windSpeedMS, 5, 2, msgBuffer); 
+
+    dtostrf(windSpeedMS, 5, 2, msgBuffer);
     mqttClient.publish((topic_base + "wind").c_str(), msgBuffer);
 
-    
-    // Noise Processing (ADC1)
-    int16_t adc1 = ads.readADC_SingleEnded(1);
-    float voltage1 = adc1 * 0.000125; 
-    if (voltage1 < 0) voltage1 = 0;
-    
-    // Linear conversion to decibels + JSON offset
-    float noiseDb = (voltage1 * 50.0) + noise_offset;
-    
-    Serial.printf("NOISE -> Voltage: %.3f V | SPL: %.1f dBA\n", voltage1, noiseDb);
-    dtostrf(noiseDb, 5, 1, msgBuffer); 
-    mqttClient.publish((topic_base + "noise").c_str(), msgBuffer);
-    
-    Serial.println("--- Data published to MQTT ---");
-  }
+    dtostrf(tempTMP, 5, 2, msgBuffer);
+    mqttClient.publish((topic_base + "wind_temp").c_str(), msgBuffer);
 
-  // --- Check for OTA Every 60 Seconds ---
-  if (currentMillis - lastOTAcheck >= 60000) {
-    lastOTAcheck = currentMillis;
-    checkForUpdate();
+    // --- NOISE ---
+    int16_t adc1 = ads.readADC_SingleEnded(1);
+    float voltage1 = adc1 * 0.000125;
+    float noiseDb = (voltage1 * 50.0) + noise_offset;
+
+    dtostrf(noiseDb, 5, 1, msgBuffer);
+    mqttClient.publish((topic_base + "noise").c_str(), msgBuffer);
   }
 }
