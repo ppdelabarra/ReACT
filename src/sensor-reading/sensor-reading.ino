@@ -1,26 +1,24 @@
 // ================= INCLUDES =================
 #include <Wire.h>
-#include <Adafruit_ADS1X15.h>
-#include <Adafruit_MAX31865.h>
-#include <SparkFun_SCD4x_Arduino_Library.h>
-#include <ClosedCube_OPT3001.h>
-#include <math.h>
-
-// Network, OTA & Memory Includes
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
-#include <WiFiManager.h>
 #include <HTTPClient.h>
-#include <HTTPUpdate.h>
 #include <ArduinoJson.h>
-#include <Preferences.h>
 #include <PubSubClient.h>
+#include <WiFiManager.h>
+#include <Preferences.h>
+
+#include <SparkFun_SCD4x_Arduino_Library.h>
+#include <ClosedCube_OPT3001.h>
+#include <Adafruit_ADS1X15.h>
+#include <Adafruit_MAX31865.h>
 
 // ================= GITHUB / OTA CONFIG =================
 const char* version_url = "https://raw.githubusercontent.com/ppdelabarra/ReACT/main/version.json";
-const char* calibration_url = "https://raw.githubusercontent.com/ppdelabarra/ReACT/main/calibration.json";
+const char* calibration_url = "https://raw.githubusercontent.com/ppdelabarra/ReACT/main/config/calibration.json";
 
 Preferences preferences;
+
 String currentVersion;
 String deviceId;
 
@@ -28,13 +26,14 @@ unsigned long lastSensorRead = 0;
 unsigned long lastOTAcheck = 0;
 
 // ================= MQTT CONFIG =================
-const char* mqtt_server = "7e43d9945d5748a782e8a2c3257f6743.s1.eu.hivemq.cloud";
-const int mqtt_port = 8883;
-const char* mqtt_user = "ReACT";
-const char* mqtt_pass = "ThermalComfort2026";
+String mqttServer;
+uint16_t mqttPort = 8883;
+String mqttUser;
+String mqttPass;
 
 WiFiClientSecure espClient;
 PubSubClient mqttClient(espClient);
+
 String topic_base;
 String command_topic;
 
@@ -50,20 +49,45 @@ ClosedCube_OPT3001 opt3001;
 #define MAX_MOSI 23
 #define MAX_MISO 19
 #define MAX_SCK  18
-#define RREF      430.0
-#define RNOMINAL  100.0
-Adafruit_MAX31865 max31865(MAX_CS, MAX_MOSI, MAX_MISO, MAX_SCK);
+#define RREF     430.0
+#define RNOMINAL 100.0
 
+Adafruit_MAX31865 max31865(MAX_CS, MAX_MOSI, MAX_MISO, MAX_SCK);
 SCD4x scd41;
 Adafruit_ADS1115 ads;
 
 // ================= CALIBRATION GLOBALS =================
-// Rev P wind sensor: only zero-wind voltage is needed for the new regression
-float wind_zero = 1.1f;
+float wind_zero = 1.346f;
+float noise_offset = 0.0f;
+float scd_temp_offset = 0.0f;
+float scd_hum_offset = 0.0f;
 
-float noise_offset = 0.0;
-float scd_temp_offset = 0.0;
-float scd_hum_offset = 0.0;
+// ================= HELPERS =================
+bool loadMqttConfig() {
+  preferences.begin("react_system", false);
+  mqttServer = preferences.getString("mqtt_server", "");
+  mqttPort   = preferences.getUInt("mqtt_port", 8883);
+  mqttUser   = preferences.getString("mqtt_user", "");
+  mqttPass   = preferences.getString("mqtt_pass", "");
+  return mqttServer.length() > 0;
+}
+
+void saveMqttConfig(const String& server, uint16_t port, const String& user, const String& pass) {
+  preferences.begin("react_system", false);
+  preferences.putString("mqtt_server", server);
+  preferences.putUInt("mqtt_port", port);
+  preferences.putString("mqtt_user", user);
+  preferences.putString("mqtt_pass", pass);
+}
+
+bool publishValue(const String& topic, const char* payload, bool retained = false) {
+  bool ok = mqttClient.publish(topic.c_str(), payload, retained);
+  if (!ok) {
+    Serial.print("[WARN] Publish failed: ");
+    Serial.println(topic);
+  }
+  return ok;
+}
 
 // ================= OPT3001 CONFIG =================
 void configureOPT3001() {
@@ -78,9 +102,12 @@ void configureOPT3001() {
 // ================= MQTT CALLBACK =================
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
   String msg;
-  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
+  for (unsigned int i = 0; i < length; i++) {
+    msg += (char)payload[i];
+  }
 
   if (String(topic) == command_topic && msg == "calibrate_co2") {
+    Serial.println("Received calibrate_co2 command");
     scd41.stopPeriodicMeasurement();
     delay(500);
     scd41.performForcedRecalibration(400);
@@ -92,80 +119,151 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 // ================= MQTT RECONNECT =================
 void reconnectMQTT() {
   while (!mqttClient.connected()) {
+    Serial.println("Attempting MQTT connection...");
+
     String clientId = "Station-" + deviceId;
-    if (mqttClient.connect(clientId.c_str(), mqtt_user, mqtt_pass)) {
-      mqttClient.publish((topic_base + "status").c_str(), "online", true);
+
+    if (mqttClient.connect(clientId.c_str(), mqttUser.c_str(), mqttPass.c_str())) {
+      Serial.println("MQTT connected");
+      publishValue(topic_base + "status", "online", true);
       mqttClient.subscribe(command_topic.c_str());
     } else {
+      Serial.print("MQTT failed, rc=");
+      Serial.print(mqttClient.state());
+      Serial.println(" retrying in 3 seconds");
       delay(3000);
     }
   }
 }
 
 // ================= REV P WIND REGRESSION =================
-// outVolts: OUT voltage from Rev P
-// tempC: TMP-derived temperature in Celsius
-// zeroWindVolts: calibrated zero-wind OUT voltage
 float computeWindMS_RevP(float outVolts, float tempC, float zeroWindVolts) {
-  // Modern Device Rev P regression constants
   const float A = 3.038517f;
   const float B = 0.115157f;
   const float C = 3.009364f;
   const float D = 0.087288f;
 
-  // Prevent invalid fractional power for very low/negative temperatures
   if (tempC < 0.1f) tempC = 0.1f;
 
   float x = ((outVolts - zeroWindVolts) / (A * pow(tempC, B))) / D;
-
   if (x <= 0.0f) return 0.0f;
 
   float windMPH = pow(x, C);
-  return windMPH * 0.44704f; // mph -> m/s
+  return windMPH * 0.44704f;
 }
 
 // ================= JSON CALIBRATION =================
 void fetchCalibration() {
   WiFiClientSecure https;
   https.setInsecure();
+
   HTTPClient http;
 
+  Serial.print("Fetching calibration from: ");
+  Serial.println(calibration_url);
+
   http.begin(https, calibration_url);
-  if (http.GET() == 200) {
+  int code = http.GET();
+
+  if (code == 200) {
     StaticJsonDocument<4096> doc;
     String payload = http.getString();
+    DeserializationError err = deserializeJson(doc, payload);
 
-    if (!deserializeJson(doc, payload)) {
+    if (!err) {
       if (doc["devices"].containsKey(deviceId)) {
         JsonObject dev = doc["devices"][deviceId];
 
-        // New Rev P model only needs zeroVolts
-        wind_zero = dev["wind"]["zeroVolts"] | 1.346f;
-
-        noise_offset   = dev["noise"]["dbOffset"] | 0.0f;
+        wind_zero       = dev["wind"]["zeroVolts"] | 1.346f;
+        noise_offset    = dev["noise"]["dbOffset"] | 0.0f;
         scd_temp_offset = dev["scd41"]["tempOffset"] | 0.0f;
         scd_hum_offset  = dev["scd41"]["humidityOffset"] | 0.0f;
+
+        Serial.println("Calibration loaded for device.");
+      } else {
+        Serial.println("No device-specific calibration found; using defaults.");
       }
+    } else {
+      Serial.print("Calibration JSON parse failed: ");
+      Serial.println(err.c_str());
     }
+  } else {
+    Serial.print("Calibration HTTP GET failed, code=");
+    Serial.println(code);
   }
+
   http.end();
+}
+
+// ================= WIFI + MQTT CONFIG PORTAL =================
+void setupConnectivity() {
+  WiFi.mode(WIFI_STA);
+
+  WiFiManager wm;
+
+  char mqttServerBuf[80] = "";
+  char mqttPortBuf[8] = "8883";
+  char mqttUserBuf[40] = "";
+  char mqttPassBuf[80] = "";
+
+  String savedServer = preferences.getString("mqtt_server", "");
+  uint16_t savedPort = preferences.getUInt("mqtt_port", 8883);
+  String savedUser   = preferences.getString("mqtt_user", "");
+  String savedPass   = preferences.getString("mqtt_pass", "");
+
+  savedServer.toCharArray(mqttServerBuf, sizeof(mqttServerBuf));
+  String(savedPort).toCharArray(mqttPortBuf, sizeof(mqttPortBuf));
+  savedUser.toCharArray(mqttUserBuf, sizeof(mqttUserBuf));
+  savedPass.toCharArray(mqttPassBuf, sizeof(mqttPassBuf));
+
+  WiFiManagerParameter custom_mqtt_server("server", "MQTT server", mqttServerBuf, sizeof(mqttServerBuf));
+  WiFiManagerParameter custom_mqtt_port("port", "MQTT port", mqttPortBuf, sizeof(mqttPortBuf));
+  WiFiManagerParameter custom_mqtt_user("user", "MQTT user", mqttUserBuf, sizeof(mqttUserBuf));
+  WiFiManagerParameter custom_mqtt_pass("pass", "MQTT password", mqttPassBuf, sizeof(mqttPassBuf));
+
+  wm.addParameter(&custom_mqtt_server);
+  wm.addParameter(&custom_mqtt_port);
+  wm.addParameter(&custom_mqtt_user);
+  wm.addParameter(&custom_mqtt_pass);
+
+  wm.setConfigPortalTimeout(180);
+
+  if (!wm.autoConnect("ReACT_Station_Setup")) {
+    Serial.println("WiFiManager failed or timed out, restarting...");
+    delay(3000);
+    ESP.restart();
+  }
+
+  mqttServer = String(custom_mqtt_server.getValue());
+  mqttPort   = (uint16_t) String(custom_mqtt_port.getValue()).toInt();
+  mqttUser   = String(custom_mqtt_user.getValue());
+  mqttPass   = String(custom_mqtt_pass.getValue());
+
+  if (mqttPort == 0) mqttPort = 8883;
+
+  saveMqttConfig(mqttServer, mqttPort, mqttUser, mqttPass);
+
+  Serial.println("WiFi connected");
+  Serial.print("IP: ");
+  Serial.println(WiFi.localIP());
 }
 
 // ================= SETUP =================
 void setup() {
   Serial.begin(115200);
-  preferences.begin("react_system", false);
+  delay(500);
 
-  WiFi.mode(WIFI_STA);
-  WiFiManager wm;
-  wm.autoConnect("ReACT_Station_Setup");
+  preferences.begin("react_system", false);
+  loadMqttConfig();
+
+  setupConnectivity();
 
   deviceId = WiFi.macAddress();
   topic_base = "sensor/" + deviceId + "/";
   command_topic = topic_base + "command";
 
   espClient.setInsecure();
-  mqttClient.setServer(mqtt_server, mqtt_port);
+  mqttClient.setServer(mqttServer.c_str(), mqttPort);
   mqttClient.setCallback(mqttCallback);
 
   fetchCalibration();
@@ -179,81 +277,85 @@ void setup() {
   configureOPT3001();
 
   ads.begin();
-  ads.setGain(GAIN_ONE);   // ADS1115: 0.125 mV/bit for single-ended conversion
+  ads.setGain(GAIN_ONE);
 
   max31865.begin(MAX31865_4WIRE);
 
   Serial.println("System started");
   Serial.print("Device ID: ");
   Serial.println(deviceId);
+  Serial.print("Topic base: ");
+  Serial.println(topic_base);
   Serial.print("Wind zero voltage: ");
   Serial.println(wind_zero, 4);
 }
 
 // ================= LOOP =================
 void loop() {
-  if (!mqttClient.connected()) reconnectMQTT();
+  if (!mqttClient.connected()) {
+    reconnectMQTT();
+  }
+
   mqttClient.loop();
 
   if (millis() - lastSensorRead >= 5000) {
     lastSensorRead = millis();
 
-    char msgBuffer[20];
+    char msgBuffer[24];
 
     // ================= SCD41 =================
-    if (scd41.getDataReadyStatus() && scd41.readMeasurement()) {
-      float temp = scd41.getTemperature() + scd_temp_offset;
-      float hum  = scd41.getHumidity() + scd_hum_offset;
-      uint16_t co2 = scd41.getCO2();
+    bool dataReady = false;
+    if (scd41.getDataReadyStatus(dataReady) && dataReady) {
+      if (scd41.readMeasurement()) {
+        float temp = scd41.getTemperature() + scd_temp_offset;
+        float hum  = scd41.getHumidity() + scd_hum_offset;
+        uint16_t co2 = scd41.getCO2();
 
-      dtostrf(temp, 5, 2, msgBuffer);
-      mqttClient.publish((topic_base + "temp").c_str(), msgBuffer);
+        dtostrf(temp, 5, 2, msgBuffer);
+        publishValue(topic_base + "temp", msgBuffer);
 
-      dtostrf(hum, 5, 1, msgBuffer);
-      mqttClient.publish((topic_base + "humidity").c_str(), msgBuffer);
+        dtostrf(hum, 5, 1, msgBuffer);
+        publishValue(topic_base + "humidity", msgBuffer);
 
-      snprintf(msgBuffer, sizeof(msgBuffer), "%u", co2);
-      mqttClient.publish((topic_base + "co2").c_str(), msgBuffer);
+        snprintf(msgBuffer, sizeof(msgBuffer), "%u", co2);
+        publishValue(topic_base + "co2", msgBuffer);
+      } else {
+        Serial.println("[WARN] Failed reading SCD41");
+      }
     }
 
     // ================= LIGHT =================
     OPT3001 result = opt3001.readResult();
     dtostrf(result.lux, 6, 0, msgBuffer);
-    mqttClient.publish((topic_base + "lux").c_str(), msgBuffer);
+    publishValue(topic_base + "lux", msgBuffer);
 
     // ================= GLOBE =================
     float globeTemp = max31865.temperature(RNOMINAL, RREF);
     dtostrf(globeTemp, 5, 2, msgBuffer);
-    mqttClient.publish((topic_base + "globe").c_str(), msgBuffer);
+    publishValue(topic_base + "globe", msgBuffer);
 
-    // ================= WIND SENSOR (REV P NEW REGRESSION) =================
-    // OUT = A0, TMP = A1
+    // ================= WIND SENSOR =================
     int16_t adc0 = ads.readADC_SingleEnded(0);
     int16_t adc1 = ads.readADC_SingleEnded(1);
 
-    float voltageOUT = adc0 * 0.000125f;   // GAIN_ONE => 125 uV/bit
+    float voltageOUT = adc0 * 0.000125f;
     float voltageTMP = adc1 * 0.000125f;
 
-    // TMP formula from sensor documentation
     float tempTMP = (voltageTMP - 0.400f) / 0.0195f;
-
-    // Compute wind speed in m/s with Rev P regression
     float windSpeedMS = computeWindMS_RevP(voltageOUT, tempTMP, wind_zero);
 
     dtostrf(windSpeedMS, 5, 2, msgBuffer);
-    mqttClient.publish((topic_base + "wind").c_str(), msgBuffer);
+    publishValue(topic_base + "wind", msgBuffer);
 
     dtostrf(tempTMP, 5, 2, msgBuffer);
-    mqttClient.publish((topic_base + "wind_temp").c_str(), msgBuffer);
+    publishValue(topic_base + "wind_temp", msgBuffer);
 
-    // Optional raw debug channels
     dtostrf(voltageOUT, 5, 3, msgBuffer);
-    mqttClient.publish((topic_base + "wind_out_volts").c_str(), msgBuffer);
+    publishValue(topic_base + "wind_out_volts", msgBuffer);
 
     dtostrf(voltageTMP, 5, 3, msgBuffer);
-    mqttClient.publish((topic_base + "wind_tmp_volts").c_str(), msgBuffer);
+    publishValue(topic_base + "wind_tmp_volts", msgBuffer);
 
-    // Serial debug
     Serial.print("OUT=");
     Serial.print(voltageOUT, 4);
     Serial.print(" V, TMP=");
@@ -267,6 +369,7 @@ void loop() {
     if (voltageTMP < 0.30f || voltageTMP > 1.50f) {
       Serial.println("[WARN] Wind TMP voltage out of expected range");
     }
+
     if (voltageOUT < 0.20f || voltageOUT > 2.30f) {
       Serial.println("[WARN] Wind OUT voltage unusual for still/low wind");
     }
@@ -277,6 +380,6 @@ void loop() {
     float noiseDb = (voltage2 * 50.0f) + noise_offset;
 
     dtostrf(noiseDb, 5, 1, msgBuffer);
-    mqttClient.publish((topic_base + "noise").c_str(), msgBuffer);
+    publishValue(topic_base + "noise", msgBuffer);
   }
 }
