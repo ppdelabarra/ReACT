@@ -17,6 +17,7 @@
 const char* version_url = "https://raw.githubusercontent.com/ppdelabarra/ReACT/main/version.json";
 const char* calibration_url = "https://raw.githubusercontent.com/ppdelabarra/ReACT/main/config/calibration.json";
 
+// ================= GLOBALS =================
 Preferences preferences;
 
 String currentVersion;
@@ -62,9 +63,8 @@ float noise_offset = 0.0f;
 float scd_temp_offset = 0.0f;
 float scd_hum_offset = 0.0f;
 
-// ================= HELPERS =================
+// ================= MQTT STORAGE HELPERS =================
 bool loadMqttConfig() {
-  preferences.begin("react_system", false);
   mqttServer = preferences.getString("mqtt_server", "");
   mqttPort   = preferences.getUInt("mqtt_port", 8883);
   mqttUser   = preferences.getString("mqtt_user", "");
@@ -73,13 +73,13 @@ bool loadMqttConfig() {
 }
 
 void saveMqttConfig(const String& server, uint16_t port, const String& user, const String& pass) {
-  preferences.begin("react_system", false);
   preferences.putString("mqtt_server", server);
   preferences.putUInt("mqtt_port", port);
   preferences.putString("mqtt_user", user);
   preferences.putString("mqtt_pass", pass);
 }
 
+// ================= PUBLISH HELPER =================
 bool publishValue(const String& topic, const char* payload, bool retained = false) {
   bool ok = mqttClient.publish(topic.c_str(), payload, retained);
   if (!ok) {
@@ -136,7 +136,7 @@ void reconnectMQTT() {
   }
 }
 
-// ================= REV P WIND REGRESSION =================
+// ================= WIND REGRESSION =================
 float computeWindMS_RevP(float outVolts, float tempC, float zeroWindVolts) {
   const float A = 3.038517f;
   const float B = 0.115157f;
@@ -152,7 +152,7 @@ float computeWindMS_RevP(float outVolts, float tempC, float zeroWindVolts) {
   return windMPH * 0.44704f;
 }
 
-// ================= JSON CALIBRATION =================
+// ================= FETCH CALIBRATION =================
 void fetchCalibration() {
   WiFiClientSecure https;
   https.setInsecure();
@@ -195,7 +195,7 @@ void fetchCalibration() {
   http.end();
 }
 
-// ================= WIFI + MQTT CONFIG PORTAL =================
+// ================= WIFI + MQTT SETUP PORTAL =================
 void setupConnectivity() {
   WiFi.mode(WIFI_STA);
 
@@ -254,8 +254,8 @@ void setup() {
   delay(500);
 
   preferences.begin("react_system", false);
-  loadMqttConfig();
 
+  loadMqttConfig();
   setupConnectivity();
 
   deviceId = WiFi.macAddress();
@@ -304,8 +304,7 @@ void loop() {
     char msgBuffer[24];
 
     // ================= SCD41 =================
-    bool dataReady = false;
-    if (scd41.getDataReadyStatus(dataReady) && dataReady) {
+    if (scd41.getDataReadyStatus()) {
       if (scd41.readMeasurement()) {
         float temp = scd41.getTemperature() + scd_temp_offset;
         float hum  = scd41.getHumidity() + scd_hum_offset;
